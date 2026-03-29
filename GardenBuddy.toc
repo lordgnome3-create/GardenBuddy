@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: |cff55ff55Garden Buddy|r
+## Notes: Tracks your garden planters with phase timers and sound notifications
+## Author: GardenBuddy
+## Version: 1.1
+## SavedVariables: GardenBuddyDB
+
+GardenBuddy.lua
