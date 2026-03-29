@@ -204,8 +204,6 @@ end
 
 -------------------------------------------------------------------------------
 -- ROW CREATION
--- NOTE: Plain CreateFrame("Button") in 1.12 does NOT have SetNormalFontObject.
---       Use a child FontString for the label instead.
 -------------------------------------------------------------------------------
 
 local function GB_CreateRow(parent, rowIdx)
@@ -223,19 +221,26 @@ local function GB_CreateRow(parent, rowIdx)
         bg:SetTexture(0.06, 0.16, 0.06, 0.22)
     end
 
-    -- Delete button — label via FontString child (no SetNormalFontObject needed)
-    local del = CreateFrame("Button", nil, row)
+    -- Delete widget — plain Frame with mouse handlers (avoids ALL Button-only API)
+    local del = CreateFrame("Frame", nil, row)
     del:SetWidth(GB_COL_DEL)
     del:SetHeight(GB_ROW_H - 2)
     del:SetPoint("LEFT", row, "LEFT", 2, 0)
-    del:SetHighlightTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Highlight")
+    del:EnableMouse(true)
 
+    -- Highlight texture on a plain Frame is safe
+    local delHL = del:CreateTexture(nil, "HIGHLIGHT")
+    delHL:SetTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Highlight")
+    delHL:SetPoint("TOPLEFT",     del, "TOPLEFT",     0, 0)
+    delHL:SetPoint("BOTTOMRIGHT", del, "BOTTOMRIGHT", 0, 0)
+
+    -- FontString with explicit point instead of SetAllPoints
     local delTxt = del:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    delTxt:SetAllPoints(del)
+    delTxt:SetPoint("CENTER", del, "CENTER", 0, 0)
     delTxt:SetJustifyH("CENTER")
     delTxt:SetText("|cffff5555x|r")
 
-    del:SetScript("OnClick", function()
+    del:SetScript("OnMouseUp", function()
         if row.planterIdx then GB_RemovePlanter(row.planterIdx) end
     end)
     del:SetScript("OnEnter", function()
@@ -532,7 +537,7 @@ local function GB_CreateMinimapButton()
     icon:SetWidth(21)
     icon:SetHeight(21)
     icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
-    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)   -- slight crop to fit circle
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
     -- Pushed highlight overlay
     local pushed = btn:CreateTexture(nil, "ARTWORK")
@@ -541,14 +546,13 @@ local function GB_CreateMinimapButton()
     pushed:SetBlendMode("ADD")
     pushed:Hide()
 
-    -- Drag tracking state
     btn.dragging = false
 
     btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
     btn:SetScript("OnMouseDown", function()
         if arg1 == "LeftButton" then
-            btn.dragging = false   -- will be set true in OnUpdate if mouse moves
+            btn.dragging = false
             pushed:Show()
         end
     end)
@@ -559,11 +563,10 @@ local function GB_CreateMinimapButton()
     end)
 
     btn:SetScript("OnClick", function()
-        if btn.dragging then return end   -- ignore click at end of a drag
+        if btn.dragging then return end
         if arg1 == "RightButton" then
             GB_ShowAddDialog()
         else
-            -- Left-click: toggle main window
             if GardenBuddyMainFrame:IsShown() then
                 GardenBuddyMainFrame:Hide()
             else
@@ -582,7 +585,6 @@ local function GB_CreateMinimapButton()
             cx = cx / s ; cy = cy / s
             local dx = cx - mx
             local dy = cy - my
-            -- Only start dragging if mouse has moved a little (avoids accidental drags)
             if not btn.dragging and (dx * dx + dy * dy) > 25 then
                 btn.dragging = true
             end
@@ -734,7 +736,7 @@ function GB_RefreshDisplay()
 
             local phase, timeRem, phasesLeft = GB_GetStatus(p)
             local isReady = (phasesLeft == 0 and timeRem <= 0)
-            local isWarn  = (not isReady and timeRem < 300)   -- < 5 min
+            local isWarn  = (not isReady and timeRem < 300)
 
             row.nameFs:SetText("|cffddffdd" .. p.name .. "|r")
 
@@ -875,7 +877,6 @@ evFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
 evFrame:SetScript("OnEvent", function()
 
     if event == "ADDON_LOADED" and arg1 == "GardenBuddy" then
-        -- Init / merge saved vars
         if not GardenBuddyDB then
             GardenBuddyDB = GB_GetDefaults()
         else
@@ -885,14 +886,11 @@ evFrame:SetScript("OnEvent", function()
             end
         end
 
-        -- Build main window — always start HIDDEN (minimap icon or /gb show opens it)
         GardenBuddyMainFrame = GB_CreateMainFrame()
         GardenBuddyMainFrame:Hide()
 
-        -- Build minimap button
         GB_CreateMinimapButton()
 
-        -- Restore minimized state if needed
         if GardenBuddyDB.minimized then
             GardenBuddyDB.minimized = false
             GB_ToggleMinimize()
@@ -919,7 +917,7 @@ evFrame:SetScript("OnEvent", function()
             GB_AddPlanter(name)
             DEFAULT_CHAT_FRAME:AddMessage(
                 "|cff55ff55[GardenBuddy]|r Auto-detected planting! " ..
-                "Rename with |cffddffdd/gb rename <#> <name>|r if needed.")
+                "Rename with |cffddffdd/gb rename <#> <n>|r if needed.")
         end
     end
 end)
@@ -1040,7 +1038,7 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55=== Garden Buddy v" .. GARDENBUDDY_VERSION .. " ===|r")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb add [name]|r          - Track a new planter")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb remove <#>|r          - Remove planter by number")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb rename <#> <name>|r   - Rename a planter")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb rename <#> <n>|r   - Rename a planter")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb clear|r               - Remove all planters")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb list|r                - Print planters to chat")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb show|r / |cffddffdd/gb hide|r        - Show / hide window")
@@ -1052,3 +1050,12 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Minimap: left-click = toggle | right-click = add | drag = move|r")
     end
 end
+```
+
+---
+
+**Folder structure reminder:**
+```
+Interface\AddOns\GardenBuddy\
+    GardenBuddy.toc
+    GardenBuddy.lua
