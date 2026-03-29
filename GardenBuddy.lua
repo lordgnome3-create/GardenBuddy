@@ -1,17 +1,15 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua
+-- GardenBuddy.lua  v1.2
 -- Turtle WoW Garden Planter Tracker
--- A FishingBuddy-style window for tracking your garden planters
--- Tracks phase timers, phases remaining, and sounds a chime on phase change
+-- FishingBuddy-style window  •  Minimap icon  •  Phase chime alerts
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.1"
+GARDENBUDDY_VERSION = "1.2"
 
 -------------------------------------------------------------------------------
 -- CONSTANTS
 -------------------------------------------------------------------------------
 
--- Planter phase names (Turtle WoW gardening phases)
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
     [2] = "Sprouting",
@@ -21,27 +19,25 @@ local GB_PHASE_NAMES = {
 }
 local GB_TOTAL_PHASES = 5
 
--- Selectable phase durations in seconds (10 / 15 / 20 / 30 / 40 / 60 min)
-local GB_PHASE_DURATIONS    = { 600, 900, 1200, 1800, 2400, 3600 }
-local GB_DEFAULT_PHASE_DUR  = 1800   -- 30 minutes default
+local GB_PHASE_DURATIONS   = { 600, 900, 1200, 1800, 2400, 3600 }
+local GB_DEFAULT_PHASE_DUR = 1800   -- 30 min default
 
--- Maximum planters we track
-local GB_MAX_PLANTERS        = 20
+local GB_MAX_PLANTERS      = 20
 
--- UI sizing
-local GB_FRAME_W             = 320
-local GB_ROW_H               = 22
-local GB_MAX_VISIBLE_ROWS    = 8
-local GB_PAD                 = 12
+-- Frame sizing
+local GB_FRAME_W           = 330
+local GB_ROW_H             = 22
+local GB_MAX_VISIBLE_ROWS  = 8
+local GB_PAD               = 14
 
--- Column widths (must sum to ~ GB_FRAME_W - 2*GB_PAD - 20 for the delete btn)
-local GB_COL_DEL   = 14
-local GB_COL_NAME  = 78
-local GB_COL_PHASE = 82
-local GB_COL_TIME  = 70
-local GB_COL_LEFT  = 50
+-- Column widths
+local GB_COL_DEL   = 16
+local GB_COL_NAME  = 80
+local GB_COL_PHASE = 84
+local GB_COL_TIME  = 68
+local GB_COL_LEFT  = 52
 
--- Sound menu options { display label, PlaySound id }
+-- Sounds  { label, PlaySound id or nil=off }
 local GB_SOUNDS = {
     { label = "Chime",      id = "igQuestComplete"   },
     { label = "Level Up",   id = "LevelUp"           },
@@ -51,7 +47,9 @@ local GB_SOUNDS = {
     { label = "None",       id = nil                 },
 }
 
--- Chat keywords that suggest the player just placed a planter (auto-detect)
+local GB_MINIMAP_RADIUS = 80
+
+-- System/buff messages that hint the player just placed a planter
 local GB_PLANT_KEYWORDS = {
     "place the planter",
     "planter placed",
@@ -60,17 +58,19 @@ local GB_PLANT_KEYWORDS = {
     "begin planting",
     "you set down",
     "planting complete",
+    "you place a",
+    "garden planter",
 }
 
 -------------------------------------------------------------------------------
--- RUNTIME STATE  (not saved)
+-- RUNTIME STATE
 -------------------------------------------------------------------------------
 
 local GB = {}
-GB.rows         = {}      -- array of row frame objects
-GB.scrollOfs    = 0       -- scroll offset into planters list
-GB.updateTimer  = 0       -- accumulator for OnUpdate throttle
-GB.initialized  = false
+GB.rows        = {}
+GB.scrollOfs   = 0
+GB.updateTimer = 0
+GB.initialized = false
 
 -------------------------------------------------------------------------------
 -- SAVED-VARIABLE DEFAULTS
@@ -78,15 +78,15 @@ GB.initialized  = false
 
 local function GB_GetDefaults()
     return {
-        soundEnabled  = true,
-        soundIndex    = 1,                    -- index into GB_SOUNDS
-        phaseDuration = GB_DEFAULT_PHASE_DUR, -- seconds per phase
-        planters      = {},                   -- array of planter records
-        nextId        = 1,                    -- auto-increment id
-        posX          = 100,
-        posY          = -200,
-        visible       = true,
-        minimized     = false,
+        soundEnabled   = true,
+        soundIndex     = 1,
+        phaseDuration  = GB_DEFAULT_PHASE_DUR,
+        planters       = {},
+        nextId         = 1,
+        posX           = 200,
+        posY           = -200,
+        minimized      = false,
+        minimapAngle   = 195,
     }
 end
 
@@ -101,36 +101,35 @@ local function GB_FormatTime(secs)
     return string.format("%02d:%02d", m, s)
 end
 
--- Returns currentPhase (1-5), phaseTimeRemaining (secs), phasesLeft (after current)
+-- Returns currentPhase, phaseSecondsRemaining, phasesLeftAfterCurrent
 local function GB_GetStatus(planter)
-    local phaseDur  = GardenBuddyDB.phaseDuration
-    local elapsed   = GetTime() - planter.plantedAt
-    local totalTime = GB_TOTAL_PHASES * phaseDur
+    local phaseDur = GardenBuddyDB.phaseDuration
+    local elapsed  = GetTime() - planter.plantedAt
+    local totalT   = GB_TOTAL_PHASES * phaseDur
 
-    if elapsed >= totalTime then
+    if elapsed >= totalT then
         return GB_TOTAL_PHASES, 0, 0
     end
 
-    local phase      = math.floor(elapsed / phaseDur) + 1
+    local phase = math.floor(elapsed / phaseDur) + 1
     if phase > GB_TOTAL_PHASES then phase = GB_TOTAL_PHASES end
 
-    local phaseElap  = elapsed - ((phase - 1) * phaseDur)
-    local phaseRem   = phaseDur - phaseElap
-    local phasesLeft = GB_TOTAL_PHASES - phase
+    local phaseElap = elapsed - ((phase - 1) * phaseDur)
+    local phaseRem  = phaseDur - phaseElap
+    local left      = GB_TOTAL_PHASES - phase
 
-    return phase, phaseRem, phasesLeft
+    return phase, phaseRem, left
 end
 
--- Check if planter has advanced to a new phase since last check
 local function GB_DetectPhaseAdvance(planter)
-    local phase, _, _ = GB_GetStatus(planter)
+    local phase = GB_GetStatus(planter)
     if planter.lastKnownPhase == nil then
         planter.lastKnownPhase = phase
         return false
     end
     if phase > planter.lastKnownPhase then
         planter.lastKnownPhase = phase
-        return true  -- phase just advanced
+        return true
     end
     return false
 end
@@ -142,12 +141,9 @@ end
 local function GB_PlayChime()
     if not GardenBuddyDB.soundEnabled then return end
     local s = GB_SOUNDS[GardenBuddyDB.soundIndex]
-    if s and s.id then
-        PlaySound(s.id)
-    end
+    if s and s.id then PlaySound(s.id) end
 end
 
--- Runs every second; sounds chime on phase change
 local function GB_CheckAlerts()
     if not GardenBuddyDB or not GardenBuddyDB.planters then return end
     for _, planter in ipairs(GardenBuddyDB.planters) do
@@ -155,8 +151,9 @@ local function GB_CheckAlerts()
             GB_PlayChime()
             DEFAULT_CHAT_FRAME:AddMessage(
                 "|cff55ff55[GardenBuddy]|r |cffddffdd" .. planter.name ..
-                "|r has entered a new phase: |cff55ff55" ..
-                (GB_PHASE_NAMES[planter.lastKnownPhase] or "Phase " .. planter.lastKnownPhase) .. "|r")
+                "|r advanced to: |cff55ff55" ..
+                (GB_PHASE_NAMES[planter.lastKnownPhase] or
+                 "Phase " .. planter.lastKnownPhase) .. "|r")
         end
     end
 end
@@ -177,8 +174,6 @@ function GB_AddPlanter(name)
         return
     end
 
-    local phase1, _, _ = GB_GetStatus({ plantedAt = GetTime() })
-
     local p = {
         name           = name,
         plantedAt      = GetTime(),
@@ -189,10 +184,10 @@ function GB_AddPlanter(name)
     table.insert(db.planters, p)
 
     DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r Tracking: |cffddffdd" .. name .. "|r  (phase timer started)")
+        "|cff55ff55[GardenBuddy]|r Now tracking: |cffddffdd" .. name .. "|r")
 
+    -- Auto-open the window when a planter is added
     if GardenBuddyMainFrame then
-        GardenBuddyDB.visible = true
         GardenBuddyMainFrame:Show()
         GB_RefreshDisplay()
     end
@@ -209,6 +204,8 @@ end
 
 -------------------------------------------------------------------------------
 -- ROW CREATION
+-- NOTE: Plain CreateFrame("Button") in 1.12 does NOT have SetNormalFontObject.
+--       Use a child FontString for the label instead.
 -------------------------------------------------------------------------------
 
 local function GB_CreateRow(parent, rowIdx)
@@ -221,51 +218,53 @@ local function GB_CreateRow(parent, rowIdx)
     local bg = row:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints(row)
     if math.mod(rowIdx, 2) == 0 then
-        bg:SetTexture(0, 0, 0, 0.25)
+        bg:SetTexture(0, 0, 0, 0.22)
     else
-        bg:SetTexture(0.07, 0.18, 0.07, 0.25)
+        bg:SetTexture(0.06, 0.16, 0.06, 0.22)
     end
 
-    -- Delete button  [ x ]
+    -- Delete button — label via FontString child (no SetNormalFontObject needed)
     local del = CreateFrame("Button", nil, row)
     del:SetWidth(GB_COL_DEL)
-    del:SetHeight(GB_ROW_H - 4)
+    del:SetHeight(GB_ROW_H - 2)
     del:SetPoint("LEFT", row, "LEFT", 2, 0)
-    del:SetNormalFontObject("GameFontNormalSmall")
-    del:SetText("|cffff4444x|r")
+    del:SetHighlightTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Highlight")
+
+    local delTxt = del:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    delTxt:SetAllPoints(del)
+    delTxt:SetJustifyH("CENTER")
+    delTxt:SetText("|cffff5555x|r")
+
     del:SetScript("OnClick", function()
-        if row.planterIdx then
-            GB_RemovePlanter(row.planterIdx)
-        end
+        if row.planterIdx then GB_RemovePlanter(row.planterIdx) end
     end)
-    del:SetScript("OnEnter", function() GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Remove this planter", 1, 1, 1) GameTooltip:Show() end)
+    del:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Remove planter", 1, 1, 1)
+        GameTooltip:Show()
+    end)
     del:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     local xOfs = GB_COL_DEL + 4
 
-    -- Name column
     local nameFs = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     nameFs:SetWidth(GB_COL_NAME)
     nameFs:SetPoint("LEFT", row, "LEFT", xOfs, 0)
     nameFs:SetJustifyH("LEFT")
     xOfs = xOfs + GB_COL_NAME + 4
 
-    -- Phase name column
     local phaseFs = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     phaseFs:SetWidth(GB_COL_PHASE)
     phaseFs:SetPoint("LEFT", row, "LEFT", xOfs, 0)
     phaseFs:SetJustifyH("LEFT")
     xOfs = xOfs + GB_COL_PHASE + 4
 
-    -- Time remaining column
     local timeFs = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     timeFs:SetWidth(GB_COL_TIME)
     timeFs:SetPoint("LEFT", row, "LEFT", xOfs, 0)
     timeFs:SetJustifyH("CENTER")
     xOfs = xOfs + GB_COL_TIME + 4
 
-    -- Phases left column
     local leftFs = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     leftFs:SetWidth(GB_COL_LEFT)
     leftFs:SetPoint("LEFT", row, "LEFT", xOfs, 0)
@@ -275,18 +274,21 @@ local function GB_CreateRow(parent, rowIdx)
     row.phaseFs = phaseFs
     row.timeFs  = timeFs
     row.leftFs  = leftFs
-    row.delBtn  = del
     row:Hide()
     return row
 end
 
 -------------------------------------------------------------------------------
--- MAIN FRAME CREATION
+-- FRAME HEIGHT HELPER
 -------------------------------------------------------------------------------
 
 local function GB_CalcFrameHeight()
-    return GB_PAD + 24 + 6 + 18 + 4 + (GB_MAX_VISIBLE_ROWS * GB_ROW_H) + 8 + 26 + 22 + GB_PAD
+    return GB_PAD + 24 + 6 + 18 + 4 + (GB_MAX_VISIBLE_ROWS * GB_ROW_H) + 6 + 24 + 4 + 24 + GB_PAD
 end
+
+-------------------------------------------------------------------------------
+-- MAIN FRAME
+-------------------------------------------------------------------------------
 
 local function GB_CreateMainFrame()
     local fh = GB_CalcFrameHeight()
@@ -308,50 +310,43 @@ local function GB_CreateMainFrame()
     f:SetClampedToScreen(true)
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", function() this:StartMoving() end)
-    f:SetScript("OnDragStop", function()
+    f:SetScript("OnDragStop",  function()
         this:StopMovingOrSizing()
         local _, _, _, x, y = this:GetPoint()
         GardenBuddyDB.posX = x
         GardenBuddyDB.posY = y
     end)
 
-    -- ===== Title Bar =====
+    ---------- Title bar ----------
     local titleBar = CreateFrame("Frame", nil, f)
     titleBar:SetHeight(24)
-    titleBar:SetPoint("TOPLEFT",  f, "TOPLEFT",  GB_PAD,     -GB_PAD)
-    titleBar:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(GB_PAD + 36), -GB_PAD)
+    titleBar:SetPoint("TOPLEFT",  f, "TOPLEFT",  GB_PAD,        -GB_PAD)
+    titleBar:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(GB_PAD + 38), -GB_PAD)
+
     local titleBg = titleBar:CreateTexture(nil, "BACKGROUND")
     titleBg:SetAllPoints(titleBar)
-    titleBg:SetTexture(0.05, 0.30, 0.05, 0.85)
-
-    local leafL = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    leafL:SetPoint("LEFT", titleBar, "LEFT", 6, 0)
-    leafL:SetText("|cff33dd33>|r")
+    titleBg:SetTexture(0.05, 0.28, 0.05, 0.88)
 
     local titleFs = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     titleFs:SetPoint("CENTER", titleBar, "CENTER", 0, 0)
-    titleFs:SetText("|cffddffdd Garden Buddy |r")
+    titleFs:SetText("|cff33dd33* |r|cffddffddGarden Buddy|r|cff33dd33 *|r")
 
     local verFs = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     verFs:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
     verFs:SetText("|cff668866v" .. GARDENBUDDY_VERSION .. "|r")
 
-    -- ===== Close Button =====
+    ---------- Close button ----------
     local closeBtn = CreateFrame("Button", "GardenBuddyCloseBtn", f, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
     closeBtn:SetScript("OnClick", function()
-        GardenBuddyDB.visible = false
         GardenBuddyMainFrame:Hide()
     end)
 
-    -- ===== Minimize Button =====
+    ---------- Minimize button ----------
     local minBtn = CreateFrame("Button", "GardenBuddyMinBtn", f)
     minBtn:SetWidth(16)
     minBtn:SetHeight(16)
     minBtn:SetPoint("TOPRIGHT", closeBtn, "TOPLEFT", -2, 0)
-    local minNorm = minBtn:CreateTexture(nil, "BACKGROUND")
-    minNorm:SetAllPoints(minBtn)
-    minNorm:SetTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Up")
     minBtn:SetNormalTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Up")
     minBtn:SetPushedTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Down")
     minBtn:SetHighlightTexture("Interface\\Buttons\\UI-Panel-MinimizeButton-Highlight")
@@ -363,39 +358,34 @@ local function GB_CreateMainFrame()
     end)
     minBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- ===== Column Headers =====
-    local hdrY = -(GB_PAD + 24 + 6)
+    ---------- Column headers ----------
+    local hdrY     = -(GB_PAD + 24 + 6)
     local hdrFrame = CreateFrame("Frame", nil, f)
     hdrFrame:SetHeight(18)
-    hdrFrame:SetPoint("TOPLEFT",  f, "TOPLEFT",  GB_PAD,     hdrY)
-    hdrFrame:SetPoint("TOPRIGHT", f, "TOPRIGHT", -GB_PAD,    hdrY)
+    hdrFrame:SetPoint("TOPLEFT",  f, "TOPLEFT",  GB_PAD,  hdrY)
+    hdrFrame:SetPoint("TOPRIGHT", f, "TOPRIGHT", -GB_PAD, hdrY)
+
     local hdrBg = hdrFrame:CreateTexture(nil, "BACKGROUND")
     hdrBg:SetAllPoints(hdrFrame)
-    hdrBg:SetTexture(0.08, 0.28, 0.08, 0.80)
+    hdrBg:SetTexture(0.08, 0.26, 0.08, 0.82)
 
-    local function MakeHeader(parent, label, width, xOfs)
-        local fs = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    local function MakeHdr(lbl, width, xOfs, justify)
+        local fs = hdrFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         fs:SetWidth(width)
-        fs:SetPoint("LEFT", parent, "LEFT", xOfs, 0)
-        fs:SetText("|cffaaffaa" .. label .. "|r")
-        fs:SetJustifyH("LEFT")
-        return fs
+        fs:SetPoint("LEFT", hdrFrame, "LEFT", xOfs, 0)
+        fs:SetText("|cffaaffaa" .. lbl .. "|r")
+        fs:SetJustifyH(justify or "LEFT")
     end
 
     local hx = GB_COL_DEL + 6
-    MakeHeader(hdrFrame, "Planter",   GB_COL_NAME,  hx)
-    hx = hx + GB_COL_NAME + 4
-    MakeHeader(hdrFrame, "Phase",     GB_COL_PHASE, hx)
-    hx = hx + GB_COL_PHASE + 4
-    local hTimeFs = MakeHeader(hdrFrame, "Remaining", GB_COL_TIME, hx)
-    hTimeFs:SetJustifyH("CENTER")
-    hx = hx + GB_COL_TIME + 4
-    local hLeftFs = MakeHeader(hdrFrame, "Left", GB_COL_LEFT, hx)
-    hLeftFs:SetJustifyH("CENTER")
+    MakeHdr("Planter",   GB_COL_NAME,  hx)          ; hx = hx + GB_COL_NAME  + 4
+    MakeHdr("Phase",     GB_COL_PHASE, hx)          ; hx = hx + GB_COL_PHASE + 4
+    MakeHdr("Remaining", GB_COL_TIME,  hx, "CENTER"); hx = hx + GB_COL_TIME  + 4
+    MakeHdr("Left",      GB_COL_LEFT,  hx, "CENTER")
 
     f.hdrFrame = hdrFrame
 
-    -- ===== Content / Row Area =====
+    ---------- Row area ----------
     local contentY = hdrY - 18 - 4
     local contentH = GB_MAX_VISIBLE_ROWS * GB_ROW_H
 
@@ -405,17 +395,16 @@ local function GB_CreateMainFrame()
     content:SetPoint("TOPRIGHT", f, "TOPRIGHT", -GB_PAD, contentY)
     f.content = content
 
-    -- "No planters" placeholder
-    local noPs = content:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    noPs:SetPoint("CENTER", content, "CENTER", 0, 0)
-    noPs:SetText("|cff668866No active planters.\n" ..
-                 "Use |r|cffddffdd/gb add|r|cff668866 or click |r|cffddffdd'Add Planter'|r|cff668866 below.|r")
-    noPs:Hide()
-    f.noPlText = noPs
+    local noPlFs = content:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    noPlFs:SetPoint("CENTER", content, "CENTER", 0, 0)
+    noPlFs:SetText("|cff668866No active planters.\n" ..
+                   "Click the minimap icon or type |r|cffddffdd/gb add|r")
+    noPlFs:Hide()
+    f.noPlText = noPlFs
 
-    -- Scroll Up / Down arrows (shown when > GB_MAX_VISIBLE_ROWS planters)
+    -- Scroll arrows
     local upArrow = CreateFrame("Button", nil, f)
-    upArrow:SetWidth(14) upArrow:SetHeight(14)
+    upArrow:SetWidth(14) ; upArrow:SetHeight(14)
     upArrow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 16, 0)
     upArrow:SetNormalTexture("Interface\\Buttons\\Arrow-Up-Up")
     upArrow:SetPushedTexture("Interface\\Buttons\\Arrow-Up-Down")
@@ -427,7 +416,7 @@ local function GB_CreateMainFrame()
     end)
 
     local downArrow = CreateFrame("Button", nil, f)
-    downArrow:SetWidth(14) downArrow:SetHeight(14)
+    downArrow:SetWidth(14) ; downArrow:SetHeight(14)
     downArrow:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", 16, 0)
     downArrow:SetNormalTexture("Interface\\Buttons\\Arrow-Down-Up")
     downArrow:SetPushedTexture("Interface\\Buttons\\Arrow-Down-Down")
@@ -442,73 +431,188 @@ local function GB_CreateMainFrame()
     f.upArrow   = upArrow
     f.downArrow = downArrow
 
-    -- Create row frames
+    -- Create all row frames
     for i = 1, GB_MAX_VISIBLE_ROWS do
         GB.rows[i] = GB_CreateRow(content, i)
     end
 
-    -- ===== Separator line =====
-    local sepY = contentY - contentH - 4
-    local sep = f:CreateTexture(nil, "ARTWORK")
+    ---------- Separator line ----------
+    local sepY = contentY - contentH - 3
+    local sep  = f:CreateTexture(nil, "ARTWORK")
     sep:SetHeight(2)
     sep:SetPoint("TOPLEFT",  f, "TOPLEFT",  GB_PAD + 4, sepY)
     sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -GB_PAD - 4, sepY)
     sep:SetTexture(0.15, 0.45, 0.15, 0.8)
 
-    -- ===== Bottom Controls Row 1 — Add button + Sound button =====
-    local ctrl1Y = -(fh - GB_PAD - 26 - 22 - 4)
+    ---------- Bottom row 1: Add Planter + Sound ----------
+    local btn1Y = GB_PAD + 24 + 4 + 24
 
     local addBtn = CreateFrame("Button", "GardenBuddyAddBtn", f, "GameMenuButtonTemplate")
-    addBtn:SetWidth(105)
+    addBtn:SetWidth(110)
     addBtn:SetHeight(22)
-    addBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", GB_PAD, GB_PAD + 26)
+    addBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", GB_PAD, btn1Y)
     addBtn:SetText("|cff55ff55+ Add Planter|r")
     addBtn:SetScript("OnClick", function() GB_ShowAddDialog() end)
 
     local soundBtn = CreateFrame("Button", "GardenBuddySoundBtn", f, "GameMenuButtonTemplate")
-    soundBtn:SetWidth(120)
+    soundBtn:SetWidth(125)
     soundBtn:SetHeight(22)
-    soundBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -GB_PAD, GB_PAD + 26)
+    soundBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -GB_PAD, btn1Y)
     soundBtn:SetScript("OnClick", function() GB_CycleSound() end)
     soundBtn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_TOP")
-        GameTooltip:SetText("Click to cycle sound options.\nA preview will play for each.", 1,1,1)
+        GameTooltip:SetText("Click to cycle alert sound.\nPlays a preview.", 1, 1, 1)
         GameTooltip:Show()
     end)
     soundBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     f.soundBtn = soundBtn
 
-    -- ===== Bottom Controls Row 2 — Duration + status hint =====
+    ---------- Bottom row 2: Phase duration ----------
     local durBtn = CreateFrame("Button", "GardenBuddyDurBtn", f, "GameMenuButtonTemplate")
-    durBtn:SetWidth(150)
+    durBtn:SetWidth(160)
     durBtn:SetHeight(22)
     durBtn:SetPoint("BOTTOM", f, "BOTTOM", 0, GB_PAD + 2)
     durBtn:SetScript("OnClick", function() GB_CycleDuration() end)
     durBtn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_TOP")
-        GameTooltip:SetText("Click to cycle phase duration.\nMust match your server's gardening timer!", 1,1,1)
+        GameTooltip:SetText("Click to change phase duration.\nMatch your server garden timer!", 1, 1, 1)
         GameTooltip:Show()
     end)
     durBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     f.durBtn = durBtn
 
-    -- ===== OnUpdate — refresh once per second =====
+    ---------- OnUpdate (throttled ~1s) ----------
     f:SetScript("OnUpdate", function()
         GB.updateTimer = GB.updateTimer + arg1
         if GB.updateTimer >= 1.0 then
             GB.updateTimer = 0
             GB_CheckAlerts()
-            GB_RefreshDisplay()
+            if GardenBuddyMainFrame:IsShown() and not GardenBuddyDB.minimized then
+                GB_RefreshDisplay()
+            end
         end
     end)
 
     GB_UpdateBottomButtons()
-
     return f
 end
 
 -------------------------------------------------------------------------------
--- UPDATE BOTTOM BUTTONS TEXT
+-- MINIMAP BUTTON
+-------------------------------------------------------------------------------
+
+local function GB_UpdateMinimapPos()
+    local btn = GardenBuddyMinimapBtn
+    if not btn then return end
+    local angle = math.rad(GardenBuddyDB.minimapAngle or 195)
+    btn:SetPoint("CENTER", Minimap, "CENTER",
+                 math.cos(angle) * GB_MINIMAP_RADIUS,
+                 math.sin(angle) * GB_MINIMAP_RADIUS)
+end
+
+local function GB_CreateMinimapButton()
+    local btn = CreateFrame("Button", "GardenBuddyMinimapBtn", Minimap)
+    btn:SetWidth(31)
+    btn:SetHeight(31)
+    btn:SetFrameStrata("MEDIUM")
+    btn:SetFrameLevel(8)
+    btn:SetMovable(true)
+    btn:SetClampedToScreen(true)
+
+    -- Standard circular minimap border
+    local border = btn:CreateTexture(nil, "OVERLAY")
+    border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+    border:SetWidth(54)
+    border:SetHeight(54)
+    border:SetPoint("TOPLEFT", btn, "TOPLEFT", -11.5, 11.5)
+
+    -- Herbalism / plant icon as the button face
+    local icon = btn:CreateTexture(nil, "BACKGROUND")
+    icon:SetTexture("Interface\\Icons\\Trade_Herbalism")
+    icon:SetWidth(21)
+    icon:SetHeight(21)
+    icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)   -- slight crop to fit circle
+
+    -- Pushed highlight overlay
+    local pushed = btn:CreateTexture(nil, "ARTWORK")
+    pushed:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+    pushed:SetAllPoints(icon)
+    pushed:SetBlendMode("ADD")
+    pushed:Hide()
+
+    -- Drag tracking state
+    btn.dragging = false
+
+    btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+
+    btn:SetScript("OnMouseDown", function()
+        if arg1 == "LeftButton" then
+            btn.dragging = false   -- will be set true in OnUpdate if mouse moves
+            pushed:Show()
+        end
+    end)
+
+    btn:SetScript("OnMouseUp", function()
+        pushed:Hide()
+        btn.dragging = false
+    end)
+
+    btn:SetScript("OnClick", function()
+        if btn.dragging then return end   -- ignore click at end of a drag
+        if arg1 == "RightButton" then
+            GB_ShowAddDialog()
+        else
+            -- Left-click: toggle main window
+            if GardenBuddyMainFrame:IsShown() then
+                GardenBuddyMainFrame:Hide()
+            else
+                GardenBuddyMainFrame:Show()
+                GB_RefreshDisplay()
+            end
+        end
+    end)
+
+    btn:SetScript("OnUpdate", function()
+        if IsMouseButtonDown("LeftButton") and
+           (GetMouseFocus() == this or btn.dragging) then
+            local mx, my = Minimap:GetCenter()
+            local cx, cy = GetCursorPosition()
+            local s      = UIParent:GetScale()
+            cx = cx / s ; cy = cy / s
+            local dx = cx - mx
+            local dy = cy - my
+            -- Only start dragging if mouse has moved a little (avoids accidental drags)
+            if not btn.dragging and (dx * dx + dy * dy) > 25 then
+                btn.dragging = true
+            end
+            if btn.dragging then
+                GardenBuddyDB.minimapAngle = math.deg(math.atan2(dy, dx))
+                GB_UpdateMinimapPos()
+            end
+        end
+    end)
+
+    btn:SetScript("OnEnter", function()
+        GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+        GameTooltip:AddLine("|cff55ff55Garden Buddy|r", 1, 1, 1)
+        GameTooltip:AddLine("Left-click:  Toggle window", 0.8, 0.8, 0.8)
+        GameTooltip:AddLine("Right-click: Add planter",  0.8, 0.8, 0.8)
+        GameTooltip:AddLine("Drag:        Reposition icon", 0.8, 0.8, 0.8)
+        local n = table.getn(GardenBuddyDB.planters)
+        if n > 0 then
+            GameTooltip:AddLine(n .. " planter(s) tracked", 0.4, 1.0, 0.4)
+        end
+        GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    GB_UpdateMinimapPos()
+    return btn
+end
+
+-------------------------------------------------------------------------------
+-- BOTTOM BUTTON LABELS
 -------------------------------------------------------------------------------
 
 function GB_UpdateBottomButtons()
@@ -516,18 +620,15 @@ function GB_UpdateBottomButtons()
     if not f then return end
     local db = GardenBuddyDB
 
-    -- Sound button
-    local sndData = GB_SOUNDS[db.soundIndex]
-    local sndName = sndData and sndData.label or "None"
-    if db.soundEnabled and sndData and sndData.id then
-        f.soundBtn:SetText("|cff55ff55Snd: " .. sndName .. "|r")
+    local snd = GB_SOUNDS[db.soundIndex]
+    if db.soundEnabled and snd and snd.id then
+        f.soundBtn:SetText("|cff55ff55Alert: " .. snd.label .. "|r")
     else
-        f.soundBtn:SetText("|cffff5555Sound: Off|r")
+        f.soundBtn:SetText("|cffff5555Alert: Off|r")
     end
 
-    -- Duration button
     local mins = math.floor(db.phaseDuration / 60)
-    f.durBtn:SetText("|cffaaffaaPhase Duration: " .. mins .. " min|r")
+    f.durBtn:SetText("|cffaaffaaPhase Timer: " .. mins .. " min|r")
 end
 
 -------------------------------------------------------------------------------
@@ -537,10 +638,10 @@ end
 function GB_CycleSound()
     local db = GardenBuddyDB
     db.soundIndex = math.mod(db.soundIndex, table.getn(GB_SOUNDS)) + 1
-    local sndData = GB_SOUNDS[db.soundIndex]
-    if sndData and sndData.id then
+    local s = GB_SOUNDS[db.soundIndex]
+    if s and s.id then
         db.soundEnabled = true
-        PlaySound(sndData.id)   -- preview
+        PlaySound(s.id)
     else
         db.soundEnabled = false
     end
@@ -552,20 +653,20 @@ end
 -------------------------------------------------------------------------------
 
 function GB_CycleDuration()
-    local db = GardenBuddyDB
+    local db  = GardenBuddyDB
     local cur = db.phaseDuration
-    local next = GB_PHASE_DURATIONS[1]
+    local nxt = GB_PHASE_DURATIONS[1]
     for i, dur in ipairs(GB_PHASE_DURATIONS) do
         if dur == cur then
-            next = GB_PHASE_DURATIONS[math.mod(i, table.getn(GB_PHASE_DURATIONS)) + 1]
+            nxt = GB_PHASE_DURATIONS[math.mod(i, table.getn(GB_PHASE_DURATIONS)) + 1]
             break
         end
     end
-    db.phaseDuration = next
+    db.phaseDuration = nxt
     GB_UpdateBottomButtons()
     DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r Phase duration set to |cffddffdd" ..
-        math.floor(next / 60) .. " minutes|r per phase.")
+        "|cff55ff55[GardenBuddy]|r Phase duration: |cffddffdd" ..
+        math.floor(nxt / 60) .. " min|r per phase.")
 end
 
 -------------------------------------------------------------------------------
@@ -608,32 +709,22 @@ end
 
 function GB_RefreshDisplay()
     local f = GardenBuddyMainFrame
-    if not f or not f:IsShown() then return end
+    if not f then return end
 
-    local db      = GardenBuddyDB
-    local planters = db.planters
-    local total   = table.getn(planters)
+    local planters = GardenBuddyDB.planters
+    local total    = table.getn(planters)
 
-    -- Placeholder text
-    if total == 0 then
-        f.noPlText:Show()
-    else
-        f.noPlText:Hide()
-    end
+    if total == 0 then f.noPlText:Show() else f.noPlText:Hide() end
 
-    -- Scroll arrows
     if total > GB_MAX_VISIBLE_ROWS then
-        f.upArrow:Show()
-        f.downArrow:Show()
+        f.upArrow:Show() ; f.downArrow:Show()
     else
-        f.upArrow:Hide()
-        f.downArrow:Hide()
+        f.upArrow:Hide() ; f.downArrow:Hide()
         GB.scrollOfs = 0
     end
 
-    -- Populate rows
     for i = 1, GB_MAX_VISIBLE_ROWS do
-        local row = GB.rows[i]
+        local row  = GB.rows[i]
         local pIdx = i + GB.scrollOfs
         local p    = planters[pIdx]
 
@@ -643,45 +734,40 @@ function GB_RefreshDisplay()
 
             local phase, timeRem, phasesLeft = GB_GetStatus(p)
             local isReady = (phasesLeft == 0 and timeRem <= 0)
-            local isWarn  = (not isReady and timeRem < 300)   -- < 5 min warning
+            local isWarn  = (not isReady and timeRem < 300)   -- < 5 min
 
-            -- Name
             row.nameFs:SetText("|cffddffdd" .. p.name .. "|r")
 
-            -- Phase name
-            local phaseName = GB_PHASE_NAMES[phase] or ("Phase " .. phase)
+            local pName = GB_PHASE_NAMES[phase] or ("Phase " .. phase)
             if isReady then
-                row.phaseFs:SetText("|cff00ff44" .. phaseName .. "|r")
+                row.phaseFs:SetText("|cff00ff44" .. pName .. "|r")
             elseif isWarn then
-                row.phaseFs:SetText("|cffffaa00" .. phaseName .. "|r")
+                row.phaseFs:SetText("|cffffbb00" .. pName .. "|r")
             else
-                row.phaseFs:SetText("|cffaaddaa" .. phaseName .. "|r")
+                row.phaseFs:SetText("|cffaaddaa" .. pName .. "|r")
             end
 
-            -- Time remaining
             if isReady then
                 row.timeFs:SetText("|cff00ff44HARVEST!|r")
             else
                 local ts = GB_FormatTime(timeRem)
                 if isWarn then
-                    row.timeFs:SetText("|cffffaa00" .. ts .. "|r")
+                    row.timeFs:SetText("|cffffbb00" .. ts .. "|r")
                 else
                     row.timeFs:SetText("|cffffffff" .. ts .. "|r")
                 end
             end
 
-            -- Phases left
             if isReady then
                 row.leftFs:SetText("|cff00ff44Done!|r")
             else
-                local leftStr = phasesLeft .. " / " .. (GB_TOTAL_PHASES - 1)
+                local ls = phasesLeft .. " / " .. (GB_TOTAL_PHASES - 1)
                 if phasesLeft <= 1 then
-                    row.leftFs:SetText("|cffffaa00" .. leftStr .. "|r")
+                    row.leftFs:SetText("|cffffbb00" .. ls .. "|r")
                 else
-                    row.leftFs:SetText("|cffaaffaa" .. leftStr .. "|r")
+                    row.leftFs:SetText("|cffaaffaa" .. ls .. "|r")
                 end
             end
-
         else
             row:Hide()
             row.planterIdx = nil
@@ -697,8 +783,8 @@ end
 
 local function GB_CreateAddDialog()
     local d = CreateFrame("Frame", "GardenBuddyAddDialog", UIParent)
-    d:SetWidth(250)
-    d:SetHeight(110)
+    d:SetWidth(255)
+    d:SetHeight(112)
     d:SetPoint("CENTER", UIParent, "CENTER")
     d:SetBackdrop({
         bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -719,13 +805,13 @@ local function GB_CreateAddDialog()
     titleFs:SetText("|cff55ff55Add Garden Planter|r")
 
     local labelFs = d:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    labelFs:SetPoint("TOPLEFT", d, "TOPLEFT", 16, -38)
+    labelFs:SetPoint("TOPLEFT", d, "TOPLEFT", 18, -38)
     labelFs:SetText("|cffddffddPlanter Name:|r")
 
     local editBox = CreateFrame("EditBox", "GardenBuddyDialogEdit", d, "InputBoxTemplate")
-    editBox:SetWidth(200)
+    editBox:SetWidth(205)
     editBox:SetHeight(20)
-    editBox:SetPoint("TOPLEFT", d, "TOPLEFT", 16, -54)
+    editBox:SetPoint("TOPLEFT", d, "TOPLEFT", 18, -54)
     editBox:SetMaxLetters(40)
     editBox:SetAutoFocus(true)
     editBox:SetScript("OnEnterPressed", function()
@@ -737,8 +823,8 @@ local function GB_CreateAddDialog()
     end)
 
     local okBtn = CreateFrame("Button", nil, d, "GameMenuButtonTemplate")
-    okBtn:SetWidth(80) okBtn:SetHeight(22)
-    okBtn:SetPoint("BOTTOMLEFT", d, "BOTTOMLEFT", 16, 12)
+    okBtn:SetWidth(80) ; okBtn:SetHeight(22)
+    okBtn:SetPoint("BOTTOMLEFT", d, "BOTTOMLEFT", 18, 12)
     okBtn:SetText("|cff55ff55Plant!|r")
     okBtn:SetScript("OnClick", function()
         GB_AddPlanter(GardenBuddyDialogEdit:GetText())
@@ -746,20 +832,16 @@ local function GB_CreateAddDialog()
     end)
 
     local cancelBtn = CreateFrame("Button", nil, d, "GameMenuButtonTemplate")
-    cancelBtn:SetWidth(80) cancelBtn:SetHeight(22)
-    cancelBtn:SetPoint("BOTTOMRIGHT", d, "BOTTOMRIGHT", -16, 12)
+    cancelBtn:SetWidth(80) ; cancelBtn:SetHeight(22)
+    cancelBtn:SetPoint("BOTTOMRIGHT", d, "BOTTOMRIGHT", -18, 12)
     cancelBtn:SetText("Cancel")
-    cancelBtn:SetScript("OnClick", function()
-        GardenBuddyAddDialog:Hide()
-    end)
+    cancelBtn:SetScript("OnClick", function() GardenBuddyAddDialog:Hide() end)
 
     d:Hide()
 end
 
 function GB_ShowAddDialog()
-    if not GardenBuddyAddDialog then
-        GB_CreateAddDialog()
-    end
+    if not GardenBuddyAddDialog then GB_CreateAddDialog() end
     local suggestName = "Planter " .. (table.getn(GardenBuddyDB.planters) + 1)
     GardenBuddyDialogEdit:SetText(suggestName)
     GardenBuddyDialogEdit:HighlightText()
@@ -768,22 +850,20 @@ function GB_ShowAddDialog()
 end
 
 -------------------------------------------------------------------------------
--- AUTO DETECT PLANTING FROM CHAT
+-- AUTO-DETECT PLANTING FROM CHAT
 -------------------------------------------------------------------------------
 
 local function GB_CheckChatForPlanting(msg)
     if not msg then return false end
     local lower = strlower(msg)
     for _, kw in ipairs(GB_PLANT_KEYWORDS) do
-        if strfind(lower, kw, 1, true) then
-            return true
-        end
+        if strfind(lower, kw, 1, true) then return true end
     end
     return false
 end
 
 -------------------------------------------------------------------------------
--- EVENT HANDLING
+-- EVENT HANDLER
 -------------------------------------------------------------------------------
 
 local evFrame = CreateFrame("Frame", "GardenBuddyEventFrame")
@@ -793,44 +873,38 @@ evFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 evFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
 
 evFrame:SetScript("OnEvent", function()
-    -- ---- Addon loaded ----
+
     if event == "ADDON_LOADED" and arg1 == "GardenBuddy" then
-        -- Init / merge saved variables
+        -- Init / merge saved vars
         if not GardenBuddyDB then
             GardenBuddyDB = GB_GetDefaults()
         else
             local def = GB_GetDefaults()
             for k, v in pairs(def) do
-                if GardenBuddyDB[k] == nil then
-                    GardenBuddyDB[k] = v
-                end
+                if GardenBuddyDB[k] == nil then GardenBuddyDB[k] = v end
             end
         end
 
-        -- Build UI
+        -- Build main window — always start HIDDEN (minimap icon or /gb show opens it)
         GardenBuddyMainFrame = GB_CreateMainFrame()
+        GardenBuddyMainFrame:Hide()
 
-        if GardenBuddyDB.visible then
-            GardenBuddyMainFrame:Show()
-        else
-            GardenBuddyMainFrame:Hide()
-        end
+        -- Build minimap button
+        GB_CreateMinimapButton()
 
+        -- Restore minimized state if needed
         if GardenBuddyDB.minimized then
-            -- Silently apply minimized state
-            GardenBuddyDB.minimized = false  -- flip so toggle works
+            GardenBuddyDB.minimized = false
             GB_ToggleMinimize()
         end
 
         GB_RefreshDisplay()
-
         DEFAULT_CHAT_FRAME:AddMessage(
             "|cff55ff55[GardenBuddy]|r v" .. GARDENBUDDY_VERSION ..
-            " loaded. Type |cffddffdd/gb help|r for commands.")
+            " loaded — click the |cff33dd33minimap icon|r to open, or use |cffddffdd/gb|r.")
 
         GB.initialized = true
 
-    -- ---- Save position on logout ----
     elseif event == "PLAYER_LOGOUT" then
         if GardenBuddyMainFrame then
             local _, _, _, x, y = GardenBuddyMainFrame:GetPoint()
@@ -838,13 +912,14 @@ evFrame:SetScript("OnEvent", function()
             GardenBuddyDB.posY = y
         end
 
-    -- ---- Auto detect planting ----
-    elseif event == "CHAT_MSG_SYSTEM" or event == "CHAT_MSG_SPELL_SELF_BUFF" then
-        if GB.initialized and GB_CheckChatForPlanting(arg1) then
-            local newName = "Planter " .. (table.getn(GardenBuddyDB.planters) + 1)
-            GB_AddPlanter(newName)
+    elseif (event == "CHAT_MSG_SYSTEM" or event == "CHAT_MSG_SPELL_SELF_BUFF")
+           and GB.initialized then
+        if GB_CheckChatForPlanting(arg1) then
+            local name = "Planter " .. (table.getn(GardenBuddyDB.planters) + 1)
+            GB_AddPlanter(name)
             DEFAULT_CHAT_FRAME:AddMessage(
-                "|cff55ff55[GardenBuddy]|r Auto-detected planting action!")
+                "|cff55ff55[GardenBuddy]|r Auto-detected planting! " ..
+                "Rename with |cffddffdd/gb rename <#> <name>|r if needed.")
         end
     end
 end)
@@ -861,7 +936,6 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
     if not msg then msg = "" end
     msg = strtrim(msg)
 
-    -- Split into cmd + rest
     local spacePos = strfind(msg, " ")
     local cmd, rest
     if spacePos then
@@ -873,43 +947,47 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
     end
 
     if cmd == "add" then
-        if strlen(rest) > 0 then
-            GB_AddPlanter(rest)
-        else
-            GB_ShowAddDialog()
-        end
+        if strlen(rest) > 0 then GB_AddPlanter(rest) else GB_ShowAddDialog() end
 
     elseif cmd == "remove" or cmd == "rem" or cmd == "del" then
         local idx = tonumber(rest)
-        if idx then
-            GB_RemovePlanter(idx)
+        if idx then GB_RemovePlanter(idx)
+        else DEFAULT_CHAT_FRAME:AddMessage(
+                 "|cff55ff55[GardenBuddy]|r Usage: /gb remove <number>") end
+
+    elseif cmd == "rename" then
+        local sp2 = strfind(rest, " ")
+        if sp2 then
+            local idx  = tonumber(strsub(rest, 1, sp2 - 1))
+            local name = strtrim(strsub(rest, sp2 + 1))
+            if idx and GardenBuddyDB.planters[idx] then
+                GardenBuddyDB.planters[idx].name = name
+                GB_RefreshDisplay()
+                DEFAULT_CHAT_FRAME:AddMessage(
+                    "|cff55ff55[GardenBuddy]|r Renamed to: |cffddffdd" .. name .. "|r")
+            end
         else
             DEFAULT_CHAT_FRAME:AddMessage(
-                "|cff55ff55[GardenBuddy]|r Usage: |cffddffdd/gb remove <number>|r")
+                "|cff55ff55[GardenBuddy]|r Usage: /gb rename <#> <new name>")
         end
 
     elseif cmd == "clear" then
         GardenBuddyDB.planters = {}
         GB.scrollOfs = 0
         GB_RefreshDisplay()
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy]|r All planters cleared.")
+        DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r All planters cleared.")
 
     elseif cmd == "show" then
-        GardenBuddyDB.visible = true
         GardenBuddyMainFrame:Show()
         GB_RefreshDisplay()
 
     elseif cmd == "hide" then
-        GardenBuddyDB.visible = false
         GardenBuddyMainFrame:Hide()
 
     elseif cmd == "toggle" then
         if GardenBuddyMainFrame:IsShown() then
-            GardenBuddyDB.visible = false
             GardenBuddyMainFrame:Hide()
         else
-            GardenBuddyDB.visible = true
             GardenBuddyMainFrame:Show()
             GB_RefreshDisplay()
         end
@@ -920,16 +998,14 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
     elseif cmd == "list" then
         local ps = GardenBuddyDB.planters
         if table.getn(ps) == 0 then
-            DEFAULT_CHAT_FRAME:AddMessage(
-                "|cff55ff55[GardenBuddy]|r No active planters.")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r No active planters.")
         else
-            DEFAULT_CHAT_FRAME:AddMessage(
-                "|cff55ff55[GardenBuddy]|r Active planters:")
+            DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Active planters:")
             for i, p in ipairs(ps) do
                 local ph, tr, pl = GB_GetStatus(p)
                 local pname = GB_PHASE_NAMES[ph] or ("Phase " .. ph)
                 DEFAULT_CHAT_FRAME:AddMessage(string.format(
-                    "  |cffddffdd#%d|r %s  |cffaaffaa%s|r  %s remaining  |cffaaffaa%d phases left|r",
+                    "  |cffddffdd#%d|r %s  |cffaaffaa%s|r  %s remaining  |cffaaffaa%d left|r",
                     i, p.name, pname, GB_FormatTime(tr), pl))
             end
         end
@@ -940,49 +1016,39 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
             GardenBuddyDB.phaseDuration = mins * 60
             GB_UpdateBottomButtons()
             DEFAULT_CHAT_FRAME:AddMessage(
-                "|cff55ff55[GardenBuddy]|r Phase duration set to |cffddffdd" .. mins .. " min|r.")
+                "|cff55ff55[GardenBuddy]|r Phase duration: |cffddffdd" .. mins .. " min|r.")
         else
             GB_CycleDuration()
         end
 
     elseif cmd == "reset" then
-        local oldPlanters = GardenBuddyDB.planters
+        local kept = GardenBuddyDB.planters
         GardenBuddyDB = GB_GetDefaults()
-        GardenBuddyDB.planters = oldPlanters   -- keep planters, reset settings only
+        GardenBuddyDB.planters = kept
         GB_UpdateBottomButtons()
         DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy]|r Settings reset to defaults (planters kept).")
+            "|cff55ff55[GardenBuddy]|r Settings reset (planters kept).")
 
     elseif cmd == "resetall" then
         GardenBuddyDB = GB_GetDefaults()
         GB.scrollOfs = 0
         GB_RefreshDisplay()
         DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy]|r Full reset — all planters and settings cleared.")
+            "|cff55ff55[GardenBuddy]|r Full reset — all data cleared.")
 
     else
-        -- Help
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55====[ Garden Buddy v" .. GARDENBUDDY_VERSION .. " ]====|r")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb add [name]|r     - Track a new planter (opens dialog if no name)")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb remove <#>|r     - Remove planter by list number")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb clear|r          - Remove all planters")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb list|r           - Print all planters to chat")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb show|r / |cffddffdd/gb hide|r  - Show or hide the window")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb toggle|r         - Toggle window visibility")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb sound|r          - Cycle through sound options")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb duration [m]|r   - Set phase duration in minutes")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb reset|r          - Reset settings (keeps planters)")
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "  |cffddffdd/gb resetall|r       - Full reset (clears everything)")
+        DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55=== Garden Buddy v" .. GARDENBUDDY_VERSION .. " ===|r")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb add [name]|r          - Track a new planter")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb remove <#>|r          - Remove planter by number")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb rename <#> <name>|r   - Rename a planter")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb clear|r               - Remove all planters")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb list|r                - Print planters to chat")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb show|r / |cffddffdd/gb hide|r        - Show / hide window")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb toggle|r              - Toggle window")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb sound|r               - Cycle alert sound")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb duration [min]|r      - Set phase length in minutes")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb reset|r               - Reset settings (keep planters)")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb resetall|r            - Full wipe")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Minimap: left-click = toggle | right-click = add | drag = move|r")
     end
 end
