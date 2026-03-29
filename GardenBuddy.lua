@@ -1,10 +1,10 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v1.2
+-- GardenBuddy.lua  v1.3
 -- Turtle WoW Garden Planter Tracker
 -- FishingBuddy-style window - Minimap icon - Phase chime alerts
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.2"
+GARDENBUDDY_VERSION = "1.3"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -15,8 +15,8 @@ local GB_PHASE_NAMES = {
 }
 local GB_TOTAL_PHASES = 5
 
-local GB_PHASE_DURATIONS   = { 600, 900, 1200, 1800, 2400, 3600 }
-local GB_DEFAULT_PHASE_DUR = 1800
+local GB_PHASE_DURATIONS   = { 540, 600, 900, 1200, 1800, 2400, 3600 }
+local GB_DEFAULT_PHASE_DUR = 540    -- 9 min default (Turtle WoW gardening)
 
 local GB_MAX_PLANTERS     = 20
 local GB_FRAME_W          = 330
@@ -430,79 +430,96 @@ end
 
 local function GB_CreateMinimapButton()
     local btn = CreateFrame("Button", "GardenBuddyMinimapBtn", Minimap)
-    btn:SetWidth(31) ; btn:SetHeight(31)
+    btn:SetWidth(31)
+    btn:SetHeight(31)
     btn:SetFrameStrata("MEDIUM")
     btn:SetFrameLevel(8)
-    btn:SetMovable(true)
     btn:SetClampedToScreen(true)
 
+    -- Circular border
     local border = btn:CreateTexture(nil, "OVERLAY")
     border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
-    border:SetWidth(54) ; border:SetHeight(54)
+    border:SetWidth(54)
+    border:SetHeight(54)
     border:SetPoint("TOPLEFT", btn, "TOPLEFT", -11.5, 11.5)
 
+    -- Firebloom herb icon
     local icon = btn:CreateTexture(nil, "BACKGROUND")
-    icon:SetTexture("Interface\\Icons\\Trade_Herbalism")
-    icon:SetWidth(21) ; icon:SetHeight(21)
+    icon:SetTexture("Interface\\Icons\\Herb_Firebloom")
+    icon:SetWidth(21)
+    icon:SetHeight(21)
     icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
+    -- Press highlight (explicit size, avoids SetAllPoints on Texture)
     local pushed = btn:CreateTexture(nil, "ARTWORK")
     pushed:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
-    pushed:SetAllPoints(icon)
+    pushed:SetWidth(21)
+    pushed:SetHeight(21)
+    pushed:SetPoint("CENTER", btn, "CENTER", 0, 0)
     pushed:SetBlendMode("ADD")
     pushed:Hide()
 
-    btn.dragging = false
+    -- State flags
+    btn.isDown   = false
+    btn.hasMoved = false
+
     btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 
     btn:SetScript("OnMouseDown", function()
         if arg1 == "LeftButton" then
-            btn.dragging = false
+            btn.isDown   = true
+            btn.hasMoved = false
             pushed:Show()
         end
     end)
+
+    -- All click logic lives in OnMouseUp so drag suppresses clicks cleanly
     btn:SetScript("OnMouseUp", function()
         pushed:Hide()
-        btn.dragging = false
-    end)
-    btn:SetScript("OnClick", function()
-        if btn.dragging then return end
-        if arg1 == "RightButton" then
+        if arg1 == "LeftButton" then
+            local moved = btn.hasMoved
+            btn.isDown   = false
+            btn.hasMoved = false
+            if not moved then
+                if GardenBuddyMainFrame:IsShown() then
+                    GardenBuddyMainFrame:Hide()
+                else
+                    GardenBuddyMainFrame:Show()
+                    GB_RefreshDisplay()
+                end
+            end
+        elseif arg1 == "RightButton" then
             GB_ShowAddDialog()
-        else
-            if GardenBuddyMainFrame:IsShown() then
-                GardenBuddyMainFrame:Hide()
-            else
-                GardenBuddyMainFrame:Show()
-                GB_RefreshDisplay()
-            end
         end
     end)
+
+    -- Drag: only active while left button is held (btn.isDown)
     btn:SetScript("OnUpdate", function()
-        if IsMouseButtonDown("LeftButton") and
-           (GetMouseFocus() == this or btn.dragging) then
-            local mx, my = Minimap:GetCenter()
-            local cx, cy = GetCursorPosition()
-            local s = UIParent:GetScale()
-            cx = cx / s ; cy = cy / s
-            local dx = cx - mx
-            local dy = cy - my
-            if not btn.dragging and (dx * dx + dy * dy) > 25 then
-                btn.dragging = true
-            end
-            if btn.dragging then
-                GardenBuddyDB.minimapAngle = math.deg(math.atan2(dy, dx))
-                GB_UpdateMinimapPos()
-            end
+        if not btn.isDown then return end
+        local mx, my = Minimap:GetCenter()
+        local cx, cy = GetCursorPosition()
+        local s = UIParent:GetScale()
+        cx = cx / s
+        cy = cy / s
+        local dx = cx - mx
+        local dy = cy - my
+        -- Require >8px displacement before treating as a drag
+        if not btn.hasMoved and (dx * dx + dy * dy) > 64 then
+            btn.hasMoved = true
+        end
+        if btn.hasMoved then
+            GardenBuddyDB.minimapAngle = math.deg(math.atan2(dy, dx))
+            GB_UpdateMinimapPos()
         end
     end)
+
     btn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this, "ANCHOR_LEFT")
         GameTooltip:AddLine("|cff55ff55Garden Buddy|r", 1, 1, 1)
         GameTooltip:AddLine("Left-click:  Toggle window", 0.8, 0.8, 0.8)
         GameTooltip:AddLine("Right-click: Add planter",  0.8, 0.8, 0.8)
-        GameTooltip:AddLine("Drag:        Reposition icon", 0.8, 0.8, 0.8)
+        GameTooltip:AddLine("Drag:        Move icon",    0.8, 0.8, 0.8)
         local n = table.getn(GardenBuddyDB.planters)
         if n > 0 then
             GameTooltip:AddLine(n .. " planter(s) tracked", 0.4, 1.0, 0.4)
@@ -526,7 +543,14 @@ function GB_UpdateBottomButtons()
         f.soundBtn:SetText("|cffff5555Alert: Off|r")
     end
     local mins = math.floor(db.phaseDuration / 60)
-    f.durBtn:SetText("|cffaaffaaPhase Timer: " .. mins .. " min|r")
+    local secs = math.mod(db.phaseDuration, 60)
+    local durStr
+    if secs == 0 then
+        durStr = mins .. " min"
+    else
+        durStr = mins .. "m " .. secs .. "s"
+    end
+    f.durBtn:SetText("|cffaaffaaPhase Timer: " .. durStr .. "|r")
 end
 
 function GB_CycleSound()
@@ -554,9 +578,16 @@ function GB_CycleDuration()
     end
     db.phaseDuration = nxt
     GB_UpdateBottomButtons()
+    local nmins = math.floor(nxt / 60)
+    local nsecs = math.mod(nxt, 60)
+    local ndurStr
+    if nsecs == 0 then
+        ndurStr = nmins .. " min"
+    else
+        ndurStr = nmins .. "m " .. nsecs .. "s"
+    end
     DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r Phase duration: |cffddffdd" ..
-        math.floor(nxt / 60) .. " min|r per phase.")
+        "|cff55ff55[GardenBuddy]|r Phase duration: |cffddffdd" .. ndurStr .. "|r per phase.")
 end
 
 function GB_ToggleMinimize()
@@ -611,7 +642,7 @@ function GB_RefreshDisplay()
             row.planterIdx = pIdx
             local phase, timeRem, phasesLeft = GB_GetStatus(p)
             local isReady = (phasesLeft == 0 and timeRem <= 0)
-            local isWarn  = (not isReady and timeRem < 300)
+            local isWarn  = (not isReady and timeRem < 120)
 
             row.nameFs:SetText("|cffddffdd" .. p.name .. "|r")
 
