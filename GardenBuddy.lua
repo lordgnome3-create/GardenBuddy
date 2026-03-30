@@ -1,10 +1,14 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v1.5
+-- GardenBuddy.lua  v1.6
 -- Turtle WoW Garden Planter Tracker
 -- FishingBuddy-style window - Minimap herb icon - Phase chime alerts
+--
+-- NOTE: WoW 1.12 runs Lua 5.0. string.match does NOT exist in Lua 5.0.
+-- All pattern matching uses string.find() with captures instead.
+-- UNIT_SPELLCAST_SUCCEEDED does not exist in 1.12; detection is chat-only.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.5"
+GARDENBUDDY_VERSION = "1.6"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -30,71 +34,57 @@ local GB_MINIMAP_RADIUS   = 80
 
 -------------------------------------------------------------------------------
 -- SOUNDS
--- PlaySoundFile takes a real .wav path and always works in 1.12.
--- PlaySound("name") only works for a small Blizzard-hardcoded list;
--- most names silently fail, which is why only "LevelUp" worked before.
+-- PlaySoundFile with a real .wav path always works in 1.12.
+-- PlaySound("name") only recognises a small hardcoded Blizzard list.
 -------------------------------------------------------------------------------
 local GB_SOUNDS = {
-    { label = "Bell",       file = "Sound\\Interface\\UI_BellTollAlliance.wav"    },
-    { label = "Level Up",   file = "Sound\\Interface\\LevelUp.wav"               },
-    { label = "Quest Done", file = "Sound\\Interface\\iQuestComplete.wav"         },
-    { label = "Loot",       file = "Sound\\Interface\\iPickUpItem.wav"            },
-    { label = "Whisper",    file = "Sound\\Interface\\iTellMessage.wav"           },
-    { label = "None",       file = nil                                            },
+    { label = "Bell",       file = "Sound\\Interface\\UI_BellTollAlliance.wav" },
+    { label = "Level Up",   file = "Sound\\Interface\\LevelUp.wav"             },
+    { label = "Quest Done", file = "Sound\\Interface\\iQuestComplete.wav"      },
+    { label = "Loot",       file = "Sound\\Interface\\iPickUpItem.wav"         },
+    { label = "Whisper",    file = "Sound\\Interface\\iTellMessage.wav"        },
+    { label = "None",       file = nil                                         },
 }
 
 -------------------------------------------------------------------------------
--- SEED / PLANTING DETECTION
+-- PLANTING DETECTION
 --
--- Strategy (three layers, most-to-least precise):
+-- WoW 1.12 does not fire UNIT_SPELLCAST_SUCCEEDED, so we rely entirely on
+-- chat messages.  Turtle WoW sends a CHAT_MSG_SYSTEM message when you plant
+-- a seed, typically:
+--   "You plant [Seed Name] in the Garden Planter."
+-- or shorter forms without brackets.
 --
--- 1. UNIT_SPELLCAST_SUCCEEDED on "player" for any spell whose name contains
---    planting-related words.  This fires the instant the cast finishes, giving
---    a very accurate timer start.
+-- We listen on CHAT_MSG_SYSTEM and CHAT_MSG_SPELL_SELF_BUFF and check every
+-- message against a table of plain-text keyword fragments (no patterns that
+-- would require string.match).  If the message matches we try to pull a seed
+-- name from inside [ ] using string.find with a capture.
 --
--- 2. CHAT_MSG_SYSTEM / CHAT_MSG_SPELL_SELF_BUFF pattern matching.
---    Turtle WoW sends messages like:
---      "You plant [Stranglekelp Seed] in the Garden Planter."
---    We parse out the seed name between [ ] if present, otherwise fall back
---    to a generic name.
---
--- 3. Manual /gb add as a fallback.
+-- If you plant and nothing auto-detects, use /gb add to add manually and
+-- please let the addon author know what message the server sends.
 -------------------------------------------------------------------------------
 
--- Spell name fragments that indicate a planting cast (lowercase)
-local GB_PLANT_SPELLS = {
-    "plant",
-    "seed",
-    "sow",
-    "garden",
-    "planter",
-    "cultivat",
+-- Plain lowercase substrings; if ANY of these appear in the message we treat
+-- it as a planting event.  Add more here if Turtle WoW uses different text.
+local GB_PLANT_SUBSTRINGS = {
+    "plant",          -- "You plant [Seed] in the Garden Planter."
+    "planter",        -- "Garden Planter" / "planter placed"
+    "sow",            -- possible "You sow a seed"
+    "garden",         -- "Garden Planter"
+    "seed",           -- generic fallback
+    "cultivat",       -- "cultivating"
 }
 
--- System message patterns (lowercase).
--- Capture group 1 = optional seed/item name between [ ] brackets.
--- If no bracket name is found we fall back to the generic planter name.
-local GB_PLANT_PATTERNS = {
-    "you plant (.+) in",
-    "you plant a (.+)",
-    "you place (.+) in the planter",
-    "you sow (.+) in",
-    "you place the planter",
-    "planter placed",
-    "you plant",
-    "plant the seed",
-    "begin planting",
-    "you set down",
-    "planting complete",
-    "you place a",
-    "garden planter",
-}
+-- We also keep a short cooldown so one planting action can't add two entries
+-- even if both CHAT_MSG_SYSTEM and CHAT_MSG_SPELL_SELF_BUFF fire for it.
+local GB_DETECT_COOLDOWN = 3   -- seconds
 
 local GB = {}
-GB.rows        = {}
-GB.scrollOfs   = 0
-GB.updateTimer = 0
-GB.initialized = false
+GB.rows           = {}
+GB.scrollOfs      = 0
+GB.updateTimer    = 0
+GB.initialized    = false
+GB.lastPlantTime  = 0   -- GetTime() of last auto-add
 
 -------------------------------------------------------------------------------
 -- SAVED-VARIABLE DEFAULTS
@@ -209,68 +199,51 @@ function GB_RemovePlanter(idx)
 end
 
 -------------------------------------------------------------------------------
--- PLANTING DETECTION HELPERS
+-- PLANTING DETECTION HELPERS (Lua 5.0 safe - no string.match)
 -------------------------------------------------------------------------------
 
--- Try to extract a clean seed/item name from a message.
--- Returns the name string or nil if not found.
+-- Returns true if the lowercased message contains any planting keyword.
+local function GB_IsPlantingMessage(msg)
+    if not msg then return false end
+    local lower = strlower(msg)
+    for _, sub in ipairs(GB_PLANT_SUBSTRINGS) do
+        if strfind(lower, sub, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Tries to extract a seed/item name from the message.
+-- Looks for text inside [ ] brackets, which is how WoW formats item names.
+-- Uses string.find with a capture group - valid in Lua 5.0.
+-- Returns the name string or nil.
 local function GB_ExtractSeedName(msg)
     if not msg then return nil end
-    -- First try to grab text inside [ ] which is how WoW formats item links
-    local bracket = string.match(msg, "%[(.-)%]")
+    -- string.find returns: startPos, endPos, cap1, cap2, ...
+    -- The third return value is our capture.
+    local _, _, bracket = string.find(msg, "%[(.-)%]")
     if bracket and strlen(bracket) > 0 then
         return bracket
-    end
-    -- Try the capture patterns for plain-text seed names
-    local lower = strlower(msg)
-    local patterns = {
-        "you plant (.+) in",
-        "you sow (.+) in",
-        "you place (.+) in the planter",
-        "you plant a (.+)",
-    }
-    for _, pat in ipairs(patterns) do
-        local m = string.match(lower, pat)
-        if m and strlen(m) > 0 then
-            -- Capitalise first letter
-            return strupper(strsub(m, 1, 1)) .. strsub(m, 2)
-        end
     end
     return nil
 end
 
--- Returns true if this system/buff message indicates a planting action.
-local function GB_IsPlantingMessage(msg)
-    if not msg then return false end
-    local lower = strlower(msg)
-    for _, pat in ipairs(GB_PLANT_PATTERNS) do
-        if strfind(lower, pat, 1, true) or string.match(lower, pat) then
-            return true
-        end
-    end
-    return false
-end
+-- Main handler called when a planting event is detected from chat.
+-- Enforces a cooldown so duplicate messages don't add multiple planters.
+local function GB_OnPlantingDetected(msg)
+    local now = GetTime()
+    if (now - GB.lastPlantTime) < GB_DETECT_COOLDOWN then return end
+    GB.lastPlantTime = now
 
--- Returns true if a successfully-cast spell name indicates planting.
-local function GB_IsPlantingSpell(spellName)
-    if not spellName then return false end
-    local lower = strlower(spellName)
-    for _, frag in ipairs(GB_PLANT_SPELLS) do
-        if strfind(lower, frag, 1, true) then
-            return true
-        end
+    local seedName = GB_ExtractSeedName(msg)
+    if not seedName then
+        seedName = "Planter " .. (table.getn(GardenBuddyDB.planters) + 1)
     end
-    return false
-end
-
--- Called by both spell and chat detection paths.
--- seedName may be nil (falls back to "Planter N").
-local function GB_OnPlantingDetected(seedName, source)
-    local name = seedName or ("Planter " .. (table.getn(GardenBuddyDB.planters) + 1))
-    GB_AddPlanter(name)
+    GB_AddPlanter(seedName)
     DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r Planting detected (" .. source .. ")!" ..
-        " Tracking: |cffddffdd" .. name .. "|r")
+        "|cff55ff55[GardenBuddy]|r Auto-detected planting! " ..
+        "Use |cffddffdd/gb rename <#> <name>|r to rename if needed.")
 end
 
 -------------------------------------------------------------------------------
@@ -518,7 +491,7 @@ local function GB_CreateMainFrame()
     soundBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     f.soundBtn = soundBtn
 
-    -- OnUpdate: throttled to ~1 second
+    -- OnUpdate throttled to ~1 second
     f:SetScript("OnUpdate", function()
         GB.updateTimer = GB.updateTimer + arg1
         if GB.updateTimer >= 1.0 then
@@ -556,11 +529,10 @@ local function GB_CreateMinimapButton()
     btn:SetClampedToScreen(true)
 
     -- SetNormalTexture is the correct 1.12 Button API for the face icon.
-    -- Swap the texture to change the herb:
+    -- Swap texture to change the herb:
     --   Firebloom:   INV_Misc_Herb_Firebloom
     --   Plaguebloom: INV_Misc_Herb_PlagueFlower
     --   Icecap:      INV_Misc_Herb_Icecap
-    --   Mageroyal:   INV_Misc_Herb_Mageroyal
     btn:SetNormalTexture("Interface\\Icons\\INV_Misc_Herb_Firebloom")
     btn:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
     btn:SetPushedTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
@@ -630,7 +602,7 @@ local function GB_CreateMinimapButton()
 end
 
 -------------------------------------------------------------------------------
--- BOTTOM BUTTON LABELS / SOUND CYCLING
+-- BOTTOM BUTTONS / SOUND
 -------------------------------------------------------------------------------
 
 function GB_UpdateBottomButtons()
@@ -715,7 +687,7 @@ function GB_RefreshDisplay()
             row.planterIdx = pIdx
             local phase, timeRem, phasesLeft = GB_GetStatus(p)
             local isReady = (phasesLeft == 0 and timeRem <= 0)
-            local isWarn  = (not isReady and timeRem < 120)  -- < 2 min
+            local isWarn  = (not isReady and timeRem < 120)
 
             row.nameFs:SetText("|cffddffdd" .. p.name .. "|r")
 
@@ -827,23 +799,16 @@ end
 
 -------------------------------------------------------------------------------
 -- EVENT HANDLER
--- Listens on three fronts for planting:
---   1. UNIT_SPELLCAST_SUCCEEDED  -- most precise; fires at cast completion
---   2. CHAT_MSG_SYSTEM           -- system messages from the server
---   3. CHAT_MSG_SPELL_SELF_BUFF  -- self-buff messages
--- All three try to extract a seed name to auto-label the planter.
 -------------------------------------------------------------------------------
 
 local evFrame = CreateFrame("Frame", "GardenBuddyEventFrame")
 evFrame:RegisterEvent("ADDON_LOADED")
 evFrame:RegisterEvent("PLAYER_LOGOUT")
-evFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 evFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 evFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
 
 evFrame:SetScript("OnEvent", function()
 
-    -- -------------------------------------------------------------------------
     if event == "ADDON_LOADED" and arg1 == "GardenBuddy" then
         if not GardenBuddyDB then
             GardenBuddyDB = GB_GetDefaults()
@@ -867,9 +832,9 @@ evFrame:SetScript("OnEvent", function()
         DEFAULT_CHAT_FRAME:AddMessage(
             "|cff55ff55[GardenBuddy]|r v" .. GARDENBUDDY_VERSION ..
             " loaded - click the |cff33dd33herb minimap icon|r or type |cffddffdd/gb|r.")
-        GB.initialized = true
+        GB.initialized    = true
+        GB.lastPlantTime  = 0
 
-    -- -------------------------------------------------------------------------
     elseif event == "PLAYER_LOGOUT" then
         if GardenBuddyMainFrame then
             local _, _, _, x, y = GardenBuddyMainFrame:GetPoint()
@@ -877,48 +842,32 @@ evFrame:SetScript("OnEvent", function()
             GardenBuddyDB.posY = y
         end
 
-    -- -------------------------------------------------------------------------
-    -- Layer 1: spell-cast detection (most precise timer start)
-    -- arg1 = unit, arg2 = spell name, arg3 = rank, arg4 = cast GUID (ignored)
-    elseif event == "UNIT_SPELLCAST_SUCCEEDED" and GB.initialized then
-        if arg1 == "player" and GB_IsPlantingSpell(arg2) then
-            -- Spell name often contains the seed name, e.g. "Plant Stranglekelp"
-            local seedName = arg2   -- use full spell name; player can rename later
-            GB_OnPlantingDetected(seedName, "spell")
-        end
-
-    -- -------------------------------------------------------------------------
-    -- Layer 2 & 3: chat message detection (fallback / cross-check)
     elseif (event == "CHAT_MSG_SYSTEM" or event == "CHAT_MSG_SPELL_SELF_BUFF")
            and GB.initialized then
-        -- arg1 = the message text
+        -- arg1 is the message text for these events
         if GB_IsPlantingMessage(arg1) then
-            -- If a spell detection already fired within the last 2 seconds
-            -- for the same planting action, skip to avoid duplicates.
-            local now = GetTime()
-            if GB.lastPlantTime and (now - GB.lastPlantTime) < 2 then
-                GB.lastPlantTime = nil   -- consume the guard
-            else
-                local seedName = GB_ExtractSeedName(arg1)
-                GB_OnPlantingDetected(seedName, "chat")
-            end
+            GB_OnPlantingDetected(arg1)
         end
     end
 end)
 
--- Guard so the spell event can suppress a near-simultaneous chat event
--- (both fire for the same planting action on some Turtle WoW builds).
-local _origOnPlantingDetected = GB_OnPlantingDetected
-GB_OnPlantingDetected = function(seedName, source)
-    if source == "spell" then
-        GB.lastPlantTime = GetTime()
-    end
-    _origOnPlantingDetected(seedName, source)
-end
-
 -------------------------------------------------------------------------------
 -- SLASH COMMANDS
+-- Includes /gb debug to print the raw next system message to chat,
+-- which helps identify what text Turtle WoW actually sends on planting.
 -------------------------------------------------------------------------------
+
+-- Debug helper: captures the next CHAT_MSG_SYSTEM and prints it
+local GB_debugCapture = false
+local GB_debugFrame   = CreateFrame("Frame", "GardenBuddyDebugFrame")
+GB_debugFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+GB_debugFrame:SetScript("OnEvent", function()
+    if GB_debugCapture and arg1 then
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff55ff55[GardenBuddy Debug]|r System msg: |cffddffdd" .. arg1 .. "|r")
+        GB_debugCapture = false
+    end
+end)
 
 SLASH_GARDENBUDDY1 = "/gb"
 SLASH_GARDENBUDDY2 = "/gardenbuddy"
@@ -1005,6 +954,14 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
             end
         end
 
+    elseif cmd == "debug" then
+        -- Captures the next system message so you can see exactly what
+        -- Turtle WoW sends when you plant a seed.
+        GB_debugCapture = true
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff55ff55[GardenBuddy]|r Debug mode: plant a seed now. " ..
+            "The next system message will be printed to chat.")
+
     elseif cmd == "reset" then
         local kept = GardenBuddyDB.planters
         GardenBuddyDB = GB_GetDefaults()
@@ -1030,9 +987,9 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb show|r / |cffddffdd/gb hide|r    - Show / hide window")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb toggle|r           - Toggle window")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb sound|r            - Cycle alert sound")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb debug|r            - Capture next system message (for tuning detection)")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb reset|r            - Reset settings (keep planters)")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb resetall|r         - Full wipe")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Auto-detects planting via spell cast or chat message.|r")
         DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Phase: 9 min fixed. Minimap: L-click=toggle, R-click=add, drag=move|r")
     end
 end
