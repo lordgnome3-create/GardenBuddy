@@ -1,5 +1,5 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v1.6
+-- GardenBuddy.lua  v1.7
 -- Turtle WoW Garden Planter Tracker
 -- FishingBuddy-style window - Minimap herb icon - Phase chime alerts
 --
@@ -8,7 +8,7 @@
 -- UNIT_SPELLCAST_SUCCEEDED does not exist in 1.12; detection is chat-only.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.6"
+GARDENBUDDY_VERSION = "1.7"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -869,19 +869,26 @@ GB_debugFrame:SetScript("OnEvent", function()
     end
 end)
 
+-- strtrim does not exist in WoW 1.12 (added in TBC).
+-- This local function replicates it using string.gsub, valid in Lua 5.0.
+local function GB_Trim(s)
+    if not s then return "" end
+    return string.gsub(s, "^%s*(.-)%s*$", "%1")
+end
+
 SLASH_GARDENBUDDY1 = "/gb"
 SLASH_GARDENBUDDY2 = "/gardenbuddy"
 SLASH_GARDENBUDDY3 = "/garden"
 
 SlashCmdList["GARDENBUDDY"] = function(msg)
     if not msg then msg = "" end
-    msg = strtrim(msg)
+    msg = GB_Trim(msg)
 
     local spacePos = strfind(msg, " ")
     local cmd, rest
     if spacePos then
         cmd  = strlower(strsub(msg, 1, spacePos - 1))
-        rest = strtrim(strsub(msg, spacePos + 1))
+        rest = GB_Trim(strsub(msg, spacePos + 1))
     else
         cmd  = strlower(msg)
         rest = ""
@@ -903,7 +910,7 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
         local sp2 = strfind(rest, " ")
         if sp2 then
             local idx  = tonumber(strsub(rest, 1, sp2 - 1))
-            local name = strtrim(strsub(rest, sp2 + 1))
+            local name = GB_Trim(strsub(rest, sp2 + 1))
             if idx and GardenBuddyDB.planters[idx] then
                 GardenBuddyDB.planters[idx].name = name
                 GB_RefreshDisplay()
