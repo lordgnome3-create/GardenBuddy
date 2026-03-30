@@ -18,7 +18,7 @@
 --   planter is added to the end of the queue.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "2.0"
+GARDENBUDDY_VERSION = "2.0.1"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -28,7 +28,7 @@ local GB_PHASE_NAMES = {
     [5] = "Harvest Ready",
 }
 local GB_TOTAL_PHASES = 5
-local GB_PHASE_DUR    = 540     -- 9 minutes per phase
+local GB_PHASE_DUR    = 546     -- 9 minutes 6 seconds per phase
 
 local GB_MAX_PLANTERS     = 20
 local GB_FRAME_W          = 330
@@ -644,10 +644,11 @@ local function GB_CreateSettingsPanel()
         GB_UpdateSettingsPanel() ; GB_UpdateSoundBtn()
     end)
 
-    local sndName = p:CreateFontString("GardenBuddySndName",nil,"GameFontNormal")
+    local sndName = p:CreateFontString(nil,"OVERLAY","GameFontNormal")
     sndName:SetWidth(112)
     sndName:SetPoint("LEFT",sndPrev,"RIGHT",4,0)
     sndName:SetJustifyH("CENTER")
+    p.sndName = sndName
 
     local sndNext = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
     sndNext:SetWidth(26) ; sndNext:SetHeight(20)
@@ -691,17 +692,19 @@ local function GB_CreateSettingsPanel()
     barBg:SetWidth(130)
     barBg:SetTexture(0,0,0,0.5)
 
-    -- Volume bar fill (green)
-    local barFill = p:CreateTexture("GardenBuddyVolBar",nil,"ARTWORK")
+    -- Volume bar fill (green) - stored on panel so GB_UpdateSettingsPanel can reach it
+    local barFill = p:CreateTexture(nil,"ARTWORK")
     barFill:SetHeight(14)
     barFill:SetPoint("LEFT",volMinus,"RIGHT",4,0)
     barFill:SetTexture(0.2,0.8,0.2,0.8)
+    p.barFill = barFill
 
     -- Volume percent text
-    local volPct = p:CreateFontString("GardenBuddyVolPct",nil,"GameFontNormalSmall")
+    local volPct = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
     volPct:SetPoint("LEFT",barBg,"RIGHT",4,0)
     volPct:SetJustifyH("LEFT")
     volPct:SetWidth(36)
+    p.volPct = volPct
 
     -- Volume plus button
     local volPlus = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
@@ -740,21 +743,21 @@ local function GB_CreateSettingsPanel()
 end
 
 function GB_UpdateSettingsPanel()
-    if not GardenBuddySettings then return end
+    local p = GardenBuddySettings
+    if not p then return end
     local db  = GardenBuddyDB
     local snd = GB_SOUNDS[db.soundIndex]
     if snd and snd.file then
-        GardenBuddySndName:SetText("|cff55ff55"..snd.label.."|r")
+        p.sndName:SetText("|cff55ff55"..snd.label.."|r")
     else
-        GardenBuddySndName:SetText("|cffff5555Off|r")
+        p.sndName:SetText("|cffff5555Off|r")
     end
-    -- Update volume bar fill width (0-130 px)
-    local v   = db.soundVolume or GB_DEFAULT_VOLUME
-    local pct = math.floor(v*100+0.5)
+    local v    = db.soundVolume or GB_DEFAULT_VOLUME
+    local pct  = math.floor(v*100+0.5)
     local barW = math.floor(v*130+0.5)
     if barW < 1 then barW = 1 end
-    GardenBuddyVolBar:SetWidth(barW)
-    GardenBuddyVolPct:SetText(pct.."%")
+    p.barFill:SetWidth(barW)
+    p.volPct:SetText(pct.."%")
 end
 
 function GB_ToggleSettings()
