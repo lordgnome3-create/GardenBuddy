@@ -18,7 +18,7 @@
 --   planter is added to the end of the queue.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "2.1"
+GARDENBUDDY_VERSION = "2.1.1"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -216,28 +216,31 @@ local function GB_CheckAlerts()
     if not GardenBuddyDB or not GardenBuddyDB.planters then return end
     for _, p in ipairs(GardenBuddyDB.planters) do
         GB_MigratePlanter(p)
-        if p.waiting then return end   -- no timer running yet, nothing to alert
-        -- Phase advance notification
-        if (p.lastKnownPhase or 1) < p.currentPhase then
-            p.lastKnownPhase = p.currentPhase
-            GB_PlayChime()
-            DEFAULT_CHAT_FRAME:AddMessage(
-                "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
-                "|r advanced to |cff55ff55" ..
-                (GB_PHASE_NAMES[p.currentPhase] or "Phase "..p.currentPhase) .. "|r")
-        end
-        -- Phase-ready notification (timer just expired)
-        if p.phaseReady and not p.phaseReadyAlerted then
-            p.phaseReadyAlerted = true
-            GB_PlayChime()
-            if p.currentPhase >= GB_TOTAL_PHASES then
+        if not p.waiting then
+            -- Force GB_GetStatus so p.phaseReady is always current
+            GB_GetStatus(p)
+            -- Phase advance notification
+            if (p.lastKnownPhase or 1) < p.currentPhase then
+                p.lastKnownPhase = p.currentPhase
+                GB_PlayChime()
                 DEFAULT_CHAT_FRAME:AddMessage(
                     "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
-                    "|r is ready to |cff00ff44HARVEST!|r")
-            else
-                DEFAULT_CHAT_FRAME:AddMessage(
-                    "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
-                    "|r phase done - |cffffaa00click planter to advance.|r")
+                    "|r advanced to |cff55ff55" ..
+                    (GB_PHASE_NAMES[p.currentPhase] or "Phase "..p.currentPhase) .. "|r")
+            end
+            -- Phase-ready notification (timer just expired)
+            if p.phaseReady and not p.phaseReadyAlerted then
+                p.phaseReadyAlerted = true
+                GB_PlayChime()
+                if p.currentPhase >= GB_TOTAL_PHASES then
+                    DEFAULT_CHAT_FRAME:AddMessage(
+                        "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
+                        "|r is ready to |cff00ff44HARVEST!|r")
+                else
+                    DEFAULT_CHAT_FRAME:AddMessage(
+                        "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
+                        "|r phase done - |cffffaa00click planter to advance.|r")
+                end
             end
         end
     end
@@ -339,12 +342,16 @@ function GB_AdvancePlanter(idx)
     GB_RefreshDisplay()
 end
 
--- Returns the index of the lowest-numbered planter that is phase-ready,
--- or nil if none are ready.
+-- Returns the index of the lowest-numbered planter that is phase-ready.
+-- Calls GB_GetStatus to ensure p.phaseReady is current even if the display
+-- hasn't refreshed since the timer expired.
 local function GB_FirstReadyIndex()
     for i, p in ipairs(GardenBuddyDB.planters) do
-        if p.phaseReady and p.currentPhase < GB_TOTAL_PHASES then
-            return i
+        if not p.waiting then
+            GB_GetStatus(p)   -- force-sets p.phaseReady if timer just expired
+            if p.phaseReady and p.currentPhase < GB_TOTAL_PHASES then
+                return i
+            end
         end
     end
     return nil
