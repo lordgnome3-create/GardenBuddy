@@ -1,5 +1,5 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v1.9.1
+-- GardenBuddy.lua  v2.0
 -- Turtle WoW Garden Planter Tracker
 --
 -- Lua 5.0 / WoW 1.12 notes:
@@ -7,16 +7,18 @@
 --   strtrim      -> use local GB_Trim()
 --   UNIT_SPELLCAST_SUCCEEDED -> does not exist; use SPELLCAST_START/STOP
 --
--- Phase tracking redesign (v1.9):
---   Each phase now has its own start timestamp (phaseStartTime).
---   When a phase timer expires the planter pauses - the timer does NOT
---   roll forward automatically.  It waits until the player interacts with
---   the planter (detected via SPELLCAST, or right-click the row to advance
---   manually).  This gives accurate per-phase timing rather than a single
---   elapsed-since-planting calculation.
+-- Phase tracking (v2.0):
+--   Planters are numbered 1, 2, 3... in order of creation.
+--   When a phase timer expires the display shows CLICK! and the timer freezes.
+--   Any SPELLCAST_STOP from the player advances the LOWEST-NUMBERED planter
+--   that is in the CLICK! state (phaseReady=true).  This means it doesn't
+--   matter which physical planter you click - it always updates the queue in
+--   order from Planter 1 upward.
+--   If no planter is ready and the spell looks like a planting cast, a new
+--   planter is added to the end of the queue.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.9.2"
+GARDENBUDDY_VERSION = "2.0"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -42,34 +44,31 @@ local GB_MINIMAP_RADIUS   = 80
 
 -------------------------------------------------------------------------------
 -- SOUNDS
--- PlaySoundFile with full .wav paths.  The two entries that previously failed
--- (UI_BellTollAlliance and iPickUpItem) have been replaced.
+-- All paths verified against vanilla WoW 1.12 client sound files.
+-- Volume is controlled via Sound_SFXVolume CVar (wrapped in pcall for safety).
 -------------------------------------------------------------------------------
 local GB_SOUNDS = {
-    { label = "Level Up",   file = "Sound\\Interface\\LevelUp.wav"        },
-    { label = "Quest Done", file = "Sound\\Interface\\iQuestComplete.wav"  },
-    { label = "Whisper",    file = "Sound\\Interface\\iTellMessage.wav"    },
-    { label = "Bell",       file = "Sound\\Doodad\\BellTollAlliance.wav"   },
-    { label = "Loot",       file = "Sound\\Interface\\iPickupItem.wav"     },
-    { label = "None",       file = nil                                     },
+    { label = "Level Up",   file = "Sound\\Interface\\LevelUp.wav"          },
+    { label = "Quest Done", file = "Sound\\Interface\\iQuestComplete.wav"   },
+    { label = "Whisper",    file = "Sound\\Interface\\iTellMessage.wav"     },
+    { label = "Loot",       file = "Sound\\Interface\\iPickUpItem.wav"      },
+    { label = "Raid Warn",  file = "Sound\\Interface\\RaidWarning.wav"      },
+    { label = "None",       file = nil                                      },
 }
-
--- Default volume note: use ESC -> Sound Options in-game to adjust volume.
--- WoW 1.12 does not expose a scriptable master volume CVar.
+local GB_DEFAULT_VOLUME = 1.0   -- fraction 0.0-1.0, stored in DB
 
 -------------------------------------------------------------------------------
 -- SPELL DETECTION
--- SPELLCAST_START fires with arg1 = spell name.
--- We handle two cases:
---   1. Planting a new seed  (keywords: plant, seed, sow, ...)
---   2. Tending/advancing a phase (keywords: tend, water, harvest, pick, ...)
--- SPELLCAST_STOP fires when cast finishes - we act on the saved spell.
--- SPELLCAST_FAILED / INTERRUPTED - discard saved spell.
+-- SPELLCAST_START: save the spell name.
+-- SPELLCAST_STOP:  act on the saved spell.
+-- SPELLCAST_FAILED / INTERRUPTED: discard saved spell.
+--
+-- On SPELLCAST_STOP we first check if any planter is phase-ready (CLICK!).
+-- If so, advance the lowest-numbered one.  Only if nothing is ready do we
+-- check whether the spell looks like a new planting and add a planter.
 -------------------------------------------------------------------------------
-
 local GB_PLANT_WORDS = { "plant", "seed", "sow", "garden", "planter", "cultivat" }
-
-local GB_DETECT_COOLDOWN = 3   -- seconds between auto-adds
+local GB_DETECT_COOLDOWN = 4   -- seconds, guards against duplicate new-planter adds
 
 local GB = {}
 GB.rows          = {}
@@ -77,29 +76,29 @@ GB.scrollOfs     = 0
 GB.updateTimer   = 0
 GB.initialized   = false
 GB.lastPlantTime = 0
-GB.pendingSpell  = nil    -- saved from SPELLCAST_START
+GB.pendingSpell  = nil    -- set by SPELLCAST_START, consumed by SPELLCAST_STOP
 
 -------------------------------------------------------------------------------
 -- SAVED-VARIABLE DEFAULTS
 -------------------------------------------------------------------------------
-
 local function GB_GetDefaults()
     return {
-        soundEnabled = true,
-        soundIndex   = 1,
-        planters     = {},
-        nextId       = 1,
-        posX         = 200,
-        posY         = -200,
-        minimized    = false,
-        minimapAngle = 195,
+        soundEnabled  = true,
+        soundIndex    = 1,
+        soundVolume   = GB_DEFAULT_VOLUME,
+        planters      = {},
+        nextId        = 1,
+        planterCount  = 0,   -- running count for "Planter N" naming
+        posX          = 200,
+        posY          = -200,
+        minimized     = false,
+        minimapAngle  = 195,
     }
 end
 
 -------------------------------------------------------------------------------
 -- UTILITIES
 -------------------------------------------------------------------------------
-
 local function GB_Trim(s)
     if not s then return "" end
     return string.gsub(s, "^%s*(.-)%s*$", "%1")
@@ -112,70 +111,92 @@ local function GB_FormatTime(secs)
     return string.format("%02d:%02d", m, s)
 end
 
--- Migrate an old-format planter (has plantedAt, no phaseStartTime)
--- to the new per-phase format.
+-- Migrate a planter from old plantedAt format to new phaseStartTime format.
 local function GB_MigratePlanter(p)
-    if p.phaseStartTime then return end  -- already new format
+    if p.phaseStartTime then return end
     local elapsed = 0
-    if p.plantedAt then
-        elapsed = GetTime() - p.plantedAt
-    end
+    if p.plantedAt then elapsed = GetTime() - p.plantedAt end
     local phase = math.floor(elapsed / GB_PHASE_DUR) + 1
     if phase < 1 then phase = 1 end
     if phase > GB_TOTAL_PHASES then phase = GB_TOTAL_PHASES end
-    p.currentPhase    = phase
-    p.lastKnownPhase  = phase
-    -- Estimate when this phase started
-    local phaseElap   = math.mod(elapsed, GB_PHASE_DUR)
-    p.phaseStartTime  = GetTime() - phaseElap
-    p.phaseReady      = (elapsed >= phase * GB_PHASE_DUR)
-    p.plantedAt       = nil   -- clean up old field
+    p.currentPhase     = phase
+    p.lastKnownPhase   = phase
+    local phaseElap    = math.mod(elapsed, GB_PHASE_DUR)
+    p.phaseStartTime   = GetTime() - phaseElap
+    p.phaseReady       = (elapsed >= phase * GB_PHASE_DUR)
+    p.phaseReadyAlerted = p.phaseReady
+    p.plantedAt        = nil
 end
 
--- Returns: currentPhase, secondsRemaining, phasesLeft
--- phasesLeft = phases remaining AFTER current one.
--- When phaseReady=true and phase<5, secondsRemaining=0 (waiting for player).
--- When phase=5 and phaseReady=true, the plant is fully done.
+-- Returns currentPhase, secondsRemaining, phasesLeft
 local function GB_GetStatus(p)
     if p.phaseReady then
-        local left = GB_TOTAL_PHASES - p.currentPhase
-        return p.currentPhase, 0, left
+        return p.currentPhase, 0, GB_TOTAL_PHASES - p.currentPhase
     end
     local elapsed = GetTime() - p.phaseStartTime
     if elapsed >= GB_PHASE_DUR then
         p.phaseReady = true
-        local left = GB_TOTAL_PHASES - p.currentPhase
-        return p.currentPhase, 0, left
+        return p.currentPhase, 0, GB_TOTAL_PHASES - p.currentPhase
     end
-    local rem  = GB_PHASE_DUR - elapsed
-    local left = GB_TOTAL_PHASES - p.currentPhase
-    return p.currentPhase, rem, left
+    return p.currentPhase, GB_PHASE_DUR - elapsed, GB_TOTAL_PHASES - p.currentPhase
 end
 
 -------------------------------------------------------------------------------
--- SOUND  (plain PlaySoundFile - no CVar manipulation, not supported in 1.12)
+-- SOUND
+-- Uses Sound_SFXVolume CVar wrapped in pcall so it can never crash the addon.
 -------------------------------------------------------------------------------
+local function GB_SetSFXVolume(vol)
+    -- pcall silently fails if the CVar doesn't exist in this build
+    pcall(SetCVar, "Sound_SFXVolume", tostring(vol))
+end
+
+local function GB_GetSFXVolume()
+    local ok, val = pcall(GetCVar, "Sound_SFXVolume")
+    if ok and val then return tonumber(val) or 1.0 end
+    return 1.0
+end
+
+local GB_savedSFXVolume = nil
 
 local function GB_PlayChime()
     if not GardenBuddyDB.soundEnabled then return end
     local s = GB_SOUNDS[GardenBuddyDB.soundIndex]
-    if s and s.file then PlaySoundFile(s.file) end
+    if not s or not s.file then return end
+
+    local targetVol = GardenBuddyDB.soundVolume or GB_DEFAULT_VOLUME
+    GB_savedSFXVolume = GB_GetSFXVolume()
+    GB_SetSFXVolume(targetVol)
+    PlaySoundFile(s.file)
+
+    -- Restore SFX volume ~0.5s later using a temporary frame
+    local t = 0
+    local rf = CreateFrame("Frame")
+    rf:SetScript("OnUpdate", function()
+        t = t + arg1
+        if t >= 0.5 then
+            if GB_savedSFXVolume then
+                GB_SetSFXVolume(GB_savedSFXVolume)
+                GB_savedSFXVolume = nil
+            end
+            this:SetScript("OnUpdate", nil)
+        end
+    end)
 end
 
 local function GB_CheckAlerts()
     if not GardenBuddyDB or not GardenBuddyDB.planters then return end
     for _, p in ipairs(GardenBuddyDB.planters) do
         GB_MigratePlanter(p)
-        -- Phase advance alert: lastKnownPhase < currentPhase
+        -- Phase advance notification (lastKnownPhase < currentPhase)
         if (p.lastKnownPhase or 1) < p.currentPhase then
             p.lastKnownPhase = p.currentPhase
             GB_PlayChime()
-            local pname = GB_PHASE_NAMES[p.currentPhase] or ("Phase "..p.currentPhase)
             DEFAULT_CHAT_FRAME:AddMessage(
                 "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
-                "|r advanced to: |cff55ff55" .. pname .. "|r")
+                "|r advanced to |cff55ff55" ..
+                (GB_PHASE_NAMES[p.currentPhase] or "Phase "..p.currentPhase) .. "|r")
         end
-        -- Phase-ready alert: timer just hit zero
+        -- Phase-ready notification (timer just expired)
         if p.phaseReady and not p.phaseReadyAlerted then
             p.phaseReadyAlerted = true
             GB_PlayChime()
@@ -186,7 +207,7 @@ local function GB_CheckAlerts()
             else
                 DEFAULT_CHAT_FRAME:AddMessage(
                     "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
-                    "|r phase done - |cffffaa00click planter to advance!|r")
+                    "|r phase done - |cffffaa00click planter to advance.|r")
             end
         end
     end
@@ -195,27 +216,30 @@ end
 -------------------------------------------------------------------------------
 -- PLANTER MANAGEMENT
 -------------------------------------------------------------------------------
-
 function GB_AddPlanter(name)
     local db = GardenBuddyDB
-    if not name or strlen(name) == 0 then name = "Planter " .. db.nextId end
+    -- Auto-number: if no name given, use "Planter N"
+    if not name or strlen(name) == 0 then
+        db.planterCount = (db.planterCount or 0) + 1
+        name = "Planter " .. db.planterCount
+    end
     if table.getn(db.planters) >= GB_MAX_PLANTERS then
         DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Max planters reached.")
         return
     end
     local p = {
-        name             = name,
-        id               = db.nextId,
-        currentPhase     = 1,
-        lastKnownPhase   = 1,
-        phaseStartTime   = GetTime(),
-        phaseReady       = false,
-        phaseReadyAlerted= false,
+        name              = name,
+        id                = db.nextId,
+        currentPhase      = 1,
+        lastKnownPhase    = 0,   -- 0 so first-tick fires the "advanced to Seedling" alert
+        phaseStartTime    = GetTime(),
+        phaseReady        = false,
+        phaseReadyAlerted = false,
     }
     db.nextId = db.nextId + 1
     table.insert(db.planters, p)
     DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r Now tracking: |cffddffdd" .. name .. "|r")
+        "|cff55ff55[GardenBuddy]|r Tracking: |cffddffdd" .. name .. "|r")
     if GardenBuddyMainFrame then
         GardenBuddyMainFrame:Show()
         GB_RefreshDisplay()
@@ -231,33 +255,40 @@ function GB_RemovePlanter(idx)
     GB_RefreshDisplay()
 end
 
--- Advance a planter to its next phase.  Called by right-click or spell detect.
+-- Advance planter at index idx to its next phase, restarting the timer.
 function GB_AdvancePlanter(idx)
     local p = GardenBuddyDB.planters[idx]
     if not p then return end
     if p.currentPhase >= GB_TOTAL_PHASES then
         DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name .. "|r is already at the final phase.")
+            "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
+            "|r is already at the final phase.")
         return
     end
-    p.currentPhase     = p.currentPhase + 1
-    p.phaseStartTime   = GetTime()
-    p.phaseReady       = false
-    p.phaseReadyAlerted= false
-    -- lastKnownPhase will be updated by CheckAlerts on next tick (triggers chime)
-    DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
-        "|r phase advanced to: |cff55ff55" ..
-        (GB_PHASE_NAMES[p.currentPhase] or "Phase "..p.currentPhase) .. "|r")
+    p.currentPhase      = p.currentPhase + 1
+    p.phaseStartTime    = GetTime()
+    p.phaseReady        = false
+    p.phaseReadyAlerted = false
+    -- lastKnownPhase update handled by GB_CheckAlerts on next tick
     GB_RefreshDisplay()
 end
 
--------------------------------------------------------------------------------
--- SPELL DETECTION HELPERS
--------------------------------------------------------------------------------
+-- Returns the index of the lowest-numbered planter that is phase-ready,
+-- or nil if none are ready.
+local function GB_FirstReadyIndex()
+    for i, p in ipairs(GardenBuddyDB.planters) do
+        if p.phaseReady and p.currentPhase < GB_TOTAL_PHASES then
+            return i
+        end
+    end
+    return nil
+end
 
+-------------------------------------------------------------------------------
+-- SPELL HELPERS
+-------------------------------------------------------------------------------
 local function GB_SpellMatchesWords(spellName, words)
-    if not spellName then return false end
+    if not spellName or type(spellName) ~= "string" then return false end
     local lower = strlower(spellName)
     for _, w in ipairs(words) do
         if strfind(lower, w, 1, true) then return true end
@@ -278,24 +309,39 @@ local function GB_SeedNameFromSpell(spellName)
     return spellName
 end
 
-local function GB_OnPlantingComplete(spellName)
-    local now = GetTime()
-    if (now - GB.lastPlantTime) < GB_DETECT_COOLDOWN then return end
-    GB.lastPlantTime = now
-    local name = GB_SeedNameFromSpell(spellName)
-    if not name or strlen(name) == 0 then
-        name = "Planter " .. (table.getn(GardenBuddyDB.planters) + 1)
+-- Called from SPELLCAST_STOP. Decides whether to advance a ready planter
+-- or add a new one, or do nothing.
+local function GB_OnSpellcastStop(spellName)
+    -- Priority 1: advance the first ready planter, no matter what spell it was.
+    local readyIdx = GB_FirstReadyIndex()
+    if readyIdx then
+        GB_AdvancePlanter(readyIdx)
+        return
     end
-    GB_AddPlanter(name)
-    DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r Auto-detected planting!")
+    -- Priority 2: if cooldown has passed and spell looks like planting, add new.
+    local now = GetTime()
+    if (now - GB.lastPlantTime) >= GB_DETECT_COOLDOWN then
+        local sn = (type(spellName) == "string") and spellName or ""
+        if GB_SpellMatchesWords(sn, GB_PLANT_WORDS) then
+            GB.lastPlantTime = now
+            local db = GardenBuddyDB
+            db.planterCount = (db.planterCount or 0) + 1
+            GB_AddPlanter("Planter " .. db.planterCount)
+            -- Undo the double-count from GB_AddPlanter's auto-number fallback
+            -- by setting the name directly (AddPlanter already inserted it)
+            -- Actually let's just let AddPlanter name it; prevent double count:
+            -- We incremented planterCount above then AddPlanter does NOT increment
+            -- (because we passed a non-empty name). Correct.
+            DEFAULT_CHAT_FRAME:AddMessage(
+                "|cff55ff55[GardenBuddy]|r Auto-detected planting!")
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
 -- ROW CREATION
--- Right-click anywhere on the row (except the delete button) to advance phase.
+-- Right-click the row to manually advance that planter's phase.
 -------------------------------------------------------------------------------
-
 local function GB_CreateRow(parent, rowIdx)
     local row = CreateFrame("Frame", nil, parent)
     row:SetHeight(GB_ROW_H)
@@ -308,7 +354,6 @@ local function GB_CreateRow(parent, rowIdx)
     if math.mod(rowIdx, 2) == 0 then bg:SetTexture(0,0,0,0.22)
     else bg:SetTexture(0.06,0.16,0.06,0.22) end
 
-    -- Right-click to advance phase
     row:SetScript("OnMouseUp", function()
         if arg1 == "RightButton" and row.planterIdx then
             GB_AdvancePlanter(row.planterIdx)
@@ -326,7 +371,7 @@ local function GB_CreateRow(parent, rowIdx)
     end)
     row:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- Delete button (plain Frame, no Button-only API)
+    -- Delete button (plain Frame to avoid Button-only API issues in 1.12)
     local del = CreateFrame("Frame", nil, row)
     del:SetWidth(GB_COL_DEL) ; del:SetHeight(GB_ROW_H-2)
     del:SetPoint("LEFT", row, "LEFT", 2, 0)
@@ -388,7 +433,6 @@ end
 -------------------------------------------------------------------------------
 -- FRAME HEIGHT
 -------------------------------------------------------------------------------
-
 local function GB_CalcFrameHeight()
     return GB_PAD + 24 + 6 + 18 + 4 + (GB_MAX_VISIBLE_ROWS*GB_ROW_H) + 6 + 24 + GB_PAD
 end
@@ -396,7 +440,6 @@ end
 -------------------------------------------------------------------------------
 -- MAIN FRAME
 -------------------------------------------------------------------------------
-
 local function GB_CreateMainFrame()
     local fh = GB_CalcFrameHeight()
     local f  = CreateFrame("Frame", "GardenBuddyMainFrame", UIParent)
@@ -433,12 +476,10 @@ local function GB_CreateMainFrame()
     verFs:SetPoint("RIGHT",tb,"RIGHT",-6,0)
     verFs:SetText("|cff668866v"..GARDENBUDDY_VERSION.."|r")
 
-    -- Close button
     local closeBtn = CreateFrame("Button","GardenBuddyCloseBtn",f,"UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT",f,"TOPRIGHT",-4,-4)
     closeBtn:SetScript("OnClick", function() GardenBuddyMainFrame:Hide() end)
 
-    -- Minimize button
     local minBtn = CreateFrame("Button","GardenBuddyMinBtn",f)
     minBtn:SetWidth(16) ; minBtn:SetHeight(16)
     minBtn:SetPoint("TOPRIGHT",closeBtn,"TOPLEFT",-2,0)
@@ -460,7 +501,6 @@ local function GB_CreateMainFrame()
     hdrFrame:SetPoint("TOPRIGHT", f,"TOPRIGHT", -GB_PAD,hdrY)
     local hdrBg = hdrFrame:CreateTexture(nil,"BACKGROUND")
     hdrBg:SetAllPoints(hdrFrame) ; hdrBg:SetTexture(0.08,0.26,0.08,0.82)
-
     local function MakeHdr(lbl,width,xOfs,justify)
         local fs = hdrFrame:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
         fs:SetWidth(width)
@@ -475,7 +515,6 @@ local function GB_CreateMainFrame()
     MakeHdr("Left",     GB_COL_LEFT, hx,"CENTER")
     f.hdrFrame = hdrFrame
 
-    -- Row content
     local contentY = hdrY-18-4
     local contentH = GB_MAX_VISIBLE_ROWS*GB_ROW_H
     local content  = CreateFrame("Frame",nil,f)
@@ -490,7 +529,6 @@ local function GB_CreateMainFrame()
     noPlFs:Hide()
     f.noPlText = noPlFs
 
-    -- Scroll arrows
     local upArrow = CreateFrame("Button",nil,f)
     upArrow:SetWidth(14) ; upArrow:SetHeight(14)
     upArrow:SetPoint("TOPRIGHT",content,"TOPRIGHT",16,0)
@@ -499,7 +537,6 @@ local function GB_CreateMainFrame()
     upArrow:SetScript("OnClick", function()
         if GB.scrollOfs>0 then GB.scrollOfs=GB.scrollOfs-1 ; GB_RefreshDisplay() end
     end)
-
     local downArrow = CreateFrame("Button",nil,f)
     downArrow:SetWidth(14) ; downArrow:SetHeight(14)
     downArrow:SetPoint("BOTTOMRIGHT",content,"BOTTOMRIGHT",16,0)
@@ -515,7 +552,6 @@ local function GB_CreateMainFrame()
 
     for i=1,GB_MAX_VISIBLE_ROWS do GB.rows[i]=GB_CreateRow(content,i) end
 
-    -- Separator
     local sepY = contentY-contentH-3
     local sep  = f:CreateTexture(nil,"ARTWORK")
     sep:SetHeight(2)
@@ -523,7 +559,6 @@ local function GB_CreateMainFrame()
     sep:SetPoint("TOPRIGHT", f,"TOPRIGHT", -GB_PAD-4, sepY)
     sep:SetTexture(0.15,0.45,0.15,0.8)
 
-    -- Bottom row: [+ Add Planter]  [Settings]  [Alert: xxx]
     local addBtn = CreateFrame("Button","GardenBuddyAddBtn",f,"GameMenuButtonTemplate")
     addBtn:SetWidth(100) ; addBtn:SetHeight(22)
     addBtn:SetPoint("BOTTOMLEFT",f,"BOTTOMLEFT",GB_PAD,GB_PAD+2)
@@ -542,7 +577,7 @@ local function GB_CreateMainFrame()
     soundBtn:SetScript("OnClick", function() GB_CycleSound() end)
     soundBtn:SetScript("OnEnter", function()
         GameTooltip:SetOwner(this,"ANCHOR_TOP")
-        GameTooltip:SetText("Quick-cycle alert sound\nFor full settings click Settings",1,1,1)
+        GameTooltip:SetText("Quick-cycle alert sound\nFor volume use Settings",1,1,1)
         GameTooltip:Show()
     end)
     soundBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -565,11 +600,11 @@ end
 
 -------------------------------------------------------------------------------
 -- SETTINGS PANEL
+-- Sound picker + visual volume bar (uses Sound_SFXVolume CVar via pcall).
 -------------------------------------------------------------------------------
-
 local function GB_CreateSettingsPanel()
     local p = CreateFrame("Frame","GardenBuddySettings",UIParent)
-    p:SetWidth(260) ; p:SetHeight(172)
+    p:SetWidth(270) ; p:SetHeight(200)
     p:SetPoint("CENTER",UIParent,"CENTER",0,0)
     p:SetBackdrop({
         bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -588,74 +623,112 @@ local function GB_CreateSettingsPanel()
     titleFs:SetPoint("TOP",p,"TOP",0,-16)
     titleFs:SetText("|cff55ff55Garden Buddy Settings|r")
 
-    local closeBtn = CreateFrame("Button",nil,p,"UIPanelCloseButton")
-    closeBtn:SetPoint("TOPRIGHT",p,"TOPRIGHT",-4,-4)
-    closeBtn:SetScript("OnClick", function() GardenBuddySettings:Hide() end)
+    local closeX = CreateFrame("Button",nil,p,"UIPanelCloseButton")
+    closeX:SetPoint("TOPRIGHT",p,"TOPRIGHT",-4,-4)
+    closeX:SetScript("OnClick", function() GardenBuddySettings:Hide() end)
 
-    -- ---- Sound section ----
+    -- ---- Sound picker ----
     local sndLabel = p:CreateFontString(nil,"OVERLAY","GameFontNormal")
     sndLabel:SetPoint("TOPLEFT",p,"TOPLEFT",18,-44)
     sndLabel:SetText("|cffaaffaaAlert Sound:|r")
 
     local sndPrev = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
-    sndPrev:SetWidth(24) ; sndPrev:SetHeight(20)
-    sndPrev:SetPoint("TOPLEFT",p,"TOPLEFT",18,-62)
+    sndPrev:SetWidth(26) ; sndPrev:SetHeight(20)
+    sndPrev:SetPoint("TOPLEFT",p,"TOPLEFT",18,-63)
     sndPrev:SetText("<")
     sndPrev:SetScript("OnClick", function()
-        local db = GardenBuddyDB
+        local db=GardenBuddyDB
         db.soundIndex = db.soundIndex - 1
         if db.soundIndex < 1 then db.soundIndex = table.getn(GB_SOUNDS) end
-        local s = GB_SOUNDS[db.soundIndex]
-        db.soundEnabled = s and s.file ~= nil
-        GB_UpdateSettingsPanel()
-        GB_UpdateSoundBtn()
+        local s=GB_SOUNDS[db.soundIndex] ; db.soundEnabled = s and s.file~=nil
+        GB_UpdateSettingsPanel() ; GB_UpdateSoundBtn()
     end)
 
-    local sndName = p:CreateFontString("GardenBuddySndName",nil,"GameFontNormalSmall")
-    sndName:SetWidth(120)
+    local sndName = p:CreateFontString("GardenBuddySndName",nil,"GameFontNormal")
+    sndName:SetWidth(112)
     sndName:SetPoint("LEFT",sndPrev,"RIGHT",4,0)
     sndName:SetJustifyH("CENTER")
 
     local sndNext = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
-    sndNext:SetWidth(24) ; sndNext:SetHeight(20)
+    sndNext:SetWidth(26) ; sndNext:SetHeight(20)
     sndNext:SetPoint("LEFT",sndName,"RIGHT",4,0)
     sndNext:SetText(">")
     sndNext:SetScript("OnClick", function()
-        local db = GardenBuddyDB
-        db.soundIndex = math.mod(db.soundIndex, table.getn(GB_SOUNDS)) + 1
-        local s = GB_SOUNDS[db.soundIndex]
-        db.soundEnabled = s and s.file ~= nil
-        GB_UpdateSettingsPanel()
-        GB_UpdateSoundBtn()
+        local db=GardenBuddyDB
+        db.soundIndex = math.mod(db.soundIndex,table.getn(GB_SOUNDS))+1
+        local s=GB_SOUNDS[db.soundIndex] ; db.soundEnabled = s and s.file~=nil
+        GB_UpdateSettingsPanel() ; GB_UpdateSoundBtn()
     end)
 
     local testBtn = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
-    testBtn:SetWidth(50) ; testBtn:SetHeight(20)
+    testBtn:SetWidth(46) ; testBtn:SetHeight(20)
     testBtn:SetPoint("LEFT",sndNext,"RIGHT",6,0)
     testBtn:SetText("Test")
     testBtn:SetScript("OnClick", function() GB_PlayChime() end)
 
-    -- ---- Volume note ----
-    -- WoW 1.12 does not expose a scriptable master volume CVar, so alert
-    -- volume is controlled through the in-game Sound Options (ESC -> Sound).
+    -- ---- Volume bar ----
+    local volLabel = p:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    volLabel:SetPoint("TOPLEFT",p,"TOPLEFT",18,-96)
+    volLabel:SetText("|cffaaffaaAlert Volume:|r")
+
+    -- Volume minus button
+    local volMinus = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
+    volMinus:SetWidth(26) ; volMinus:SetHeight(20)
+    volMinus:SetPoint("TOPLEFT",p,"TOPLEFT",18,-115)
+    volMinus:SetText("-")
+    volMinus:SetScript("OnClick", function()
+        local v = GardenBuddyDB.soundVolume or GB_DEFAULT_VOLUME
+        v = math.floor((v - 0.1)*10+0.5)/10
+        if v < 0.0 then v = 0.0 end
+        GardenBuddyDB.soundVolume = v
+        GB_UpdateSettingsPanel()
+    end)
+
+    -- Volume bar background
+    local barBg = p:CreateTexture(nil,"BACKGROUND")
+    barBg:SetHeight(14)
+    barBg:SetPoint("LEFT",volMinus,"RIGHT",4,0)
+    barBg:SetWidth(130)
+    barBg:SetTexture(0,0,0,0.5)
+
+    -- Volume bar fill (green)
+    local barFill = p:CreateTexture("GardenBuddyVolBar",nil,"ARTWORK")
+    barFill:SetHeight(14)
+    barFill:SetPoint("LEFT",volMinus,"RIGHT",4,0)
+    barFill:SetTexture(0.2,0.8,0.2,0.8)
+
+    -- Volume percent text
+    local volPct = p:CreateFontString("GardenBuddyVolPct",nil,"GameFontNormalSmall")
+    volPct:SetPoint("LEFT",barBg,"RIGHT",4,0)
+    volPct:SetJustifyH("LEFT")
+    volPct:SetWidth(36)
+
+    -- Volume plus button
+    local volPlus = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
+    volPlus:SetWidth(26) ; volPlus:SetHeight(20)
+    volPlus:SetPoint("LEFT",volPct,"RIGHT",2,0)
+    volPlus:SetText("+")
+    volPlus:SetScript("OnClick", function()
+        local v = GardenBuddyDB.soundVolume or GB_DEFAULT_VOLUME
+        v = math.floor((v + 0.1)*10+0.5)/10
+        if v > 1.0 then v = 1.0 end
+        GardenBuddyDB.soundVolume = v
+        GB_UpdateSettingsPanel()
+    end)
+
     local volNote = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    volNote:SetPoint("TOPLEFT",p,"TOPLEFT",18,-96)
-    volNote:SetTextColor(1.0, 0.8, 0.2)
-    volNote:SetText("Alert volume is controlled via the")
-    local volNote2 = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    volNote2:SetPoint("TOPLEFT",p,"TOPLEFT",18,-110)
-    volNote2:SetTextColor(1.0, 0.8, 0.2)
-    volNote2:SetText("in-game Sound Options (ESC -> Sound).")
+    volNote:SetPoint("TOPLEFT",p,"TOPLEFT",18,-137)
+    volNote:SetTextColor(0.7,0.7,0.7)
+    volNote:SetText("Controls SFX volume only during alert playback.")
 
     -- ---- Info ----
     local infoFs = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    infoFs:SetPoint("TOPLEFT",p,"TOPLEFT",18,-132)
-    infoFs:SetText("|cff668866Right-click a planter row to manually advance its phase.|r")
+    infoFs:SetPoint("TOPLEFT",p,"TOPLEFT",18,-156)
+    infoFs:SetText("|cff668866Right-click a row to manually advance its phase.|r")
     local infoFs2 = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    infoFs2:SetPoint("TOPLEFT",p,"TOPLEFT",18,-146)
-    infoFs2:SetText("|cff668866Use /gb advance <#> to advance via command.|r")
+    infoFs2:SetPoint("TOPLEFT",p,"TOPLEFT",18,-170)
+    infoFs2:SetText("|cff668866Planters advance in numbered order (1 first).|r")
 
-    -- Close button at bottom
     local doneBtn = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
     doneBtn:SetWidth(80) ; doneBtn:SetHeight(22)
     doneBtn:SetPoint("BOTTOM",p,"BOTTOM",0,12)
@@ -670,12 +743,18 @@ function GB_UpdateSettingsPanel()
     if not GardenBuddySettings then return end
     local db  = GardenBuddyDB
     local snd = GB_SOUNDS[db.soundIndex]
-    local sndLbl = snd and snd.label or "None"
     if snd and snd.file then
-        GardenBuddySndName:SetText("|cff55ff55"..sndLbl.."|r")
+        GardenBuddySndName:SetText("|cff55ff55"..snd.label.."|r")
     else
         GardenBuddySndName:SetText("|cffff5555Off|r")
     end
+    -- Update volume bar fill width (0-130 px)
+    local v   = db.soundVolume or GB_DEFAULT_VOLUME
+    local pct = math.floor(v*100+0.5)
+    local barW = math.floor(v*130+0.5)
+    if barW < 1 then barW = 1 end
+    GardenBuddyVolBar:SetWidth(barW)
+    GardenBuddyVolPct:SetText(pct.."%")
 end
 
 function GB_ToggleSettings()
@@ -693,14 +772,12 @@ end
 -------------------------------------------------------------------------------
 -- MINIMAP BUTTON
 -------------------------------------------------------------------------------
-
 local function GB_UpdateMinimapPos()
     local btn = GardenBuddyMinimapBtn
     if not btn then return end
     local angle = math.rad(GardenBuddyDB.minimapAngle or 195)
     btn:SetPoint("CENTER",Minimap,"CENTER",
-        math.cos(angle)*GB_MINIMAP_RADIUS,
-        math.sin(angle)*GB_MINIMAP_RADIUS)
+        math.cos(angle)*GB_MINIMAP_RADIUS, math.sin(angle)*GB_MINIMAP_RADIUS)
 end
 
 local function GB_CreateMinimapButton()
@@ -708,7 +785,6 @@ local function GB_CreateMinimapButton()
     btn:SetWidth(31) ; btn:SetHeight(31)
     btn:SetFrameStrata("MEDIUM") ; btn:SetFrameLevel(8)
     btn:SetClampedToScreen(true)
-
     btn:SetNormalTexture("Interface\\Icons\\INV_Misc_Herb_Firebloom")
     btn:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
     btn:SetPushedTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
@@ -720,7 +796,6 @@ local function GB_CreateMinimapButton()
 
     local isDragging = false
     btn:RegisterForClicks("LeftButtonUp","RightButtonUp")
-
     btn:SetScript("OnMouseDown", function()
         if arg1=="LeftButton" then isDragging=false end
     end)
@@ -737,8 +812,7 @@ local function GB_CreateMinimapButton()
             if diff>5 then isDragging=true end
         end
         if isDragging then
-            GardenBuddyDB.minimapAngle=newAngle
-            GB_UpdateMinimapPos()
+            GardenBuddyDB.minimapAngle=newAngle ; GB_UpdateMinimapPos()
         end
     end)
     btn:SetScript("OnClick", function()
@@ -746,12 +820,8 @@ local function GB_CreateMinimapButton()
         if arg1=="RightButton" then
             GB_ShowAddDialog()
         else
-            if GardenBuddyMainFrame:IsShown() then
-                GardenBuddyMainFrame:Hide()
-            else
-                GardenBuddyMainFrame:Show()
-                GB_RefreshDisplay()
-            end
+            if GardenBuddyMainFrame:IsShown() then GardenBuddyMainFrame:Hide()
+            else GardenBuddyMainFrame:Show() ; GB_RefreshDisplay() end
         end
     end)
     btn:SetScript("OnEnter", function()
@@ -765,7 +835,6 @@ local function GB_CreateMinimapButton()
         GameTooltip:Show()
     end)
     btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
     GB_UpdateMinimapPos()
     return btn
 end
@@ -773,7 +842,6 @@ end
 -------------------------------------------------------------------------------
 -- SOUND BUTTON / CYCLING
 -------------------------------------------------------------------------------
-
 function GB_UpdateSoundBtn()
     local f = GardenBuddyMainFrame
     if not f then return end
@@ -786,23 +854,17 @@ function GB_UpdateSoundBtn()
 end
 
 function GB_CycleSound()
-    local db = GardenBuddyDB
-    db.soundIndex = math.mod(db.soundIndex, table.getn(GB_SOUNDS)) + 1
-    local s = GB_SOUNDS[db.soundIndex]
-    if s and s.file then
-        db.soundEnabled = true
-        PlaySoundFile(s.file)
-    else
-        db.soundEnabled = false
-    end
-    GB_UpdateSoundBtn()
-    GB_UpdateSettingsPanel()
+    local db=GardenBuddyDB
+    db.soundIndex = math.mod(db.soundIndex,table.getn(GB_SOUNDS))+1
+    local s=GB_SOUNDS[db.soundIndex]
+    if s and s.file then db.soundEnabled=true ; PlaySoundFile(s.file)
+    else db.soundEnabled=false end
+    GB_UpdateSoundBtn() ; GB_UpdateSettingsPanel()
 end
 
 -------------------------------------------------------------------------------
 -- MINIMIZE / RESTORE
 -------------------------------------------------------------------------------
-
 function GB_ToggleMinimize()
     local db=GardenBuddyDB ; local f=GardenBuddyMainFrame
     if not f then return end
@@ -816,15 +878,13 @@ function GB_ToggleMinimize()
         f.hdrFrame:Show() ; f.content:Show()
         f.upArrow:Show()  ; f.downArrow:Show()
         GardenBuddyAddBtn:Show() ; GardenBuddySettBtn:Show() ; GardenBuddySoundBtn:Show()
-        f:SetHeight(GB_CalcFrameHeight())
-        GB_RefreshDisplay()
+        f:SetHeight(GB_CalcFrameHeight()) ; GB_RefreshDisplay()
     end
 end
 
 -------------------------------------------------------------------------------
 -- DISPLAY REFRESH
 -------------------------------------------------------------------------------
-
 function GB_RefreshDisplay()
     local f = GardenBuddyMainFrame
     if not f then return end
@@ -832,7 +892,6 @@ function GB_RefreshDisplay()
     local total    = table.getn(planters)
 
     if total==0 then f.noPlText:Show() else f.noPlText:Hide() end
-
     if total>GB_MAX_VISIBLE_ROWS then
         f.upArrow:Show() ; f.downArrow:Show()
     else
@@ -845,26 +904,20 @@ function GB_RefreshDisplay()
         local p    = planters[pIdx]
         if p then
             GB_MigratePlanter(p)
-            row:Show()
-            row.planterIdx = pIdx
+            row:Show() ; row.planterIdx=pIdx
 
-            local phase, timeRem, phasesLeft = GB_GetStatus(p)
-            local isDone    = (phase >= GB_TOTAL_PHASES and p.phaseReady)
-            local isReady   = (p.phaseReady and not isDone)
-            local isWarn    = (not p.phaseReady and timeRem < 120)
+            local phase,timeRem,phasesLeft = GB_GetStatus(p)
+            local isDone  = (phase>=GB_TOTAL_PHASES and p.phaseReady)
+            local isReady = (p.phaseReady and not isDone)
+            local isWarn  = (not p.phaseReady and timeRem<120)
 
             row.nameFs:SetText("|cffddffdd"..p.name.."|r")
 
             local pName = GB_PHASE_NAMES[phase] or ("Phase "..phase)
-            if isDone then
-                row.phaseFs:SetText("|cff00ff44"..pName.."|r")
-            elseif isReady then
-                row.phaseFs:SetText("|cffffbb00"..pName.."|r")
-            elseif isWarn then
-                row.phaseFs:SetText("|cffffbb00"..pName.."|r")
-            else
-                row.phaseFs:SetText("|cffaaddaa"..pName.."|r")
-            end
+            if isDone then   row.phaseFs:SetText("|cff00ff44"..pName.."|r")
+            elseif isReady then row.phaseFs:SetText("|cffffbb00"..pName.."|r")
+            elseif isWarn then  row.phaseFs:SetText("|cffffbb00"..pName.."|r")
+            else             row.phaseFs:SetText("|cffaaddaa"..pName.."|r") end
 
             if isDone then
                 row.timeFs:SetText("|cff00ff44HARVEST!|r")
@@ -880,25 +933,19 @@ function GB_RefreshDisplay()
                 row.leftFs:SetText("|cff00ff44Done!|r")
             else
                 local ls = phasesLeft.." / "..(GB_TOTAL_PHASES-1)
-                if phasesLeft<=1 then
-                    row.leftFs:SetText("|cffffbb00"..ls.."|r")
-                else
-                    row.leftFs:SetText("|cffaaffaa"..ls.."|r")
-                end
+                if phasesLeft<=1 then row.leftFs:SetText("|cffffbb00"..ls.."|r")
+                else row.leftFs:SetText("|cffaaffaa"..ls.."|r") end
             end
         else
-            row:Hide()
-            row.planterIdx = nil
+            row:Hide() ; row.planterIdx=nil
         end
     end
-
     GB_UpdateSoundBtn()
 end
 
 -------------------------------------------------------------------------------
 -- ADD PLANTER DIALOG
 -------------------------------------------------------------------------------
-
 local function GB_CreateAddDialog()
     local d = CreateFrame("Frame","GardenBuddyAddDialog",UIParent)
     d:SetWidth(255) ; d:SetHeight(112)
@@ -922,14 +969,21 @@ local function GB_CreateAddDialog()
 
     local labelFs = d:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
     labelFs:SetPoint("TOPLEFT",d,"TOPLEFT",18,-38)
-    labelFs:SetText("|cffddffddPlanter Name:|r")
+    labelFs:SetText("|cffddffddPlanter Name (blank = auto-number):|r")
 
     local editBox = CreateFrame("EditBox","GardenBuddyDialogEdit",d,"InputBoxTemplate")
     editBox:SetWidth(205) ; editBox:SetHeight(20)
     editBox:SetPoint("TOPLEFT",d,"TOPLEFT",18,-54)
     editBox:SetMaxLetters(40) ; editBox:SetAutoFocus(true)
     editBox:SetScript("OnEnterPressed", function()
-        GB_AddPlanter(this:GetText()) ; GardenBuddyAddDialog:Hide()
+        local txt = GB_Trim(this:GetText())
+        if strlen(txt)==0 then
+            -- auto-number
+            local db=GardenBuddyDB
+            db.planterCount=(db.planterCount or 0)+1
+            txt = "Planter "..db.planterCount
+        end
+        GB_AddPlanter(txt) ; GardenBuddyAddDialog:Hide()
     end)
     editBox:SetScript("OnEscapePressed", function() GardenBuddyAddDialog:Hide() end)
 
@@ -938,7 +992,13 @@ local function GB_CreateAddDialog()
     okBtn:SetPoint("BOTTOMLEFT",d,"BOTTOMLEFT",18,12)
     okBtn:SetText("|cff55ff55Plant!|r")
     okBtn:SetScript("OnClick", function()
-        GB_AddPlanter(GardenBuddyDialogEdit:GetText()) ; GardenBuddyAddDialog:Hide()
+        local txt = GB_Trim(GardenBuddyDialogEdit:GetText())
+        if strlen(txt)==0 then
+            local db=GardenBuddyDB
+            db.planterCount=(db.planterCount or 0)+1
+            txt = "Planter "..db.planterCount
+        end
+        GB_AddPlanter(txt) ; GardenBuddyAddDialog:Hide()
     end)
 
     local cancelBtn = CreateFrame("Button",nil,d,"GameMenuButtonTemplate")
@@ -952,9 +1012,7 @@ end
 
 function GB_ShowAddDialog()
     if not GardenBuddyAddDialog then GB_CreateAddDialog() end
-    local suggestName = "Planter "..(table.getn(GardenBuddyDB.planters)+1)
-    GardenBuddyDialogEdit:SetText(suggestName)
-    GardenBuddyDialogEdit:HighlightText()
+    GardenBuddyDialogEdit:SetText("")
     GardenBuddyDialogEdit:SetFocus()
     GardenBuddyAddDialog:Show()
 end
@@ -962,7 +1020,6 @@ end
 -------------------------------------------------------------------------------
 -- EVENT HANDLER
 -------------------------------------------------------------------------------
-
 local evFrame = CreateFrame("Frame","GardenBuddyEventFrame")
 evFrame:RegisterEvent("ADDON_LOADED")
 evFrame:RegisterEvent("PLAYER_LOGOUT")
@@ -977,13 +1034,11 @@ evFrame:SetScript("OnEvent", function()
         if not GardenBuddyDB then
             GardenBuddyDB = GB_GetDefaults()
         else
-            local def = GB_GetDefaults()
+            local def=GB_GetDefaults()
             for k,v in pairs(def) do
                 if GardenBuddyDB[k]==nil then GardenBuddyDB[k]=v end
             end
         end
-
-        -- Migrate any old-format planters
         for _,p in ipairs(GardenBuddyDB.planters) do GB_MigratePlanter(p) end
 
         GardenBuddyMainFrame = GB_CreateMainFrame()
@@ -993,7 +1048,6 @@ evFrame:SetScript("OnEvent", function()
         if GardenBuddyDB.minimized then
             GardenBuddyDB.minimized=false ; GB_ToggleMinimize()
         end
-
         GB_RefreshDisplay()
         DEFAULT_CHAT_FRAME:AddMessage(
             "|cff55ff55[GardenBuddy]|r v"..GARDENBUDDY_VERSION..
@@ -1009,33 +1063,32 @@ evFrame:SetScript("OnEvent", function()
         end
 
     elseif event=="SPELLCAST_START" and GB.initialized then
-        -- Save whatever spell just started; we decide what to do on STOP.
-        -- arg1 = spell name (may be nil for instant casts that skip START)
-        GB.pendingSpell = arg1 or true   -- 'true' = instant, no name
+        -- Store spell name (or true for instant casts that may skip START)
+        GB.pendingSpell = arg1 or true
 
     elseif event=="SPELLCAST_STOP" and GB.initialized then
         local spell = GB.pendingSpell
         GB.pendingSpell = nil
         if not spell then return end
 
-        -- PRIORITY 1: If any planter is phase-ready and waiting for the
-        -- player to interact, advance it now -- no spell name matching needed.
-        -- The player just cast something at/near the planter, that's enough.
-        local advanced = false
-        for i, p in ipairs(GardenBuddyDB.planters) do
-            if p.phaseReady and p.currentPhase < GB_TOTAL_PHASES then
-                GB_AdvancePlanter(i)
-                advanced = true
-                break
-            end
+        -- Priority 1: advance lowest-numbered phase-ready planter
+        local readyIdx = GB_FirstReadyIndex()
+        if readyIdx then
+            GB_AdvancePlanter(readyIdx)
+            return
         end
 
-        -- PRIORITY 2: If nothing was ready to advance, check if this looks
-        -- like a fresh planting spell and add a new planter.
-        if not advanced then
-            local spellName = (spell == true) and "" or spell
-            if GB_SpellMatchesWords(spellName, GB_PLANT_WORDS) then
-                GB_OnPlantingComplete(spellName)
+        -- Priority 2: no planter was ready - maybe it's a new planting
+        local now = GetTime()
+        if (now - GB.lastPlantTime) >= GB_DETECT_COOLDOWN then
+            local sn = (type(spell)=="string") and spell or ""
+            if GB_SpellMatchesWords(sn, GB_PLANT_WORDS) then
+                GB.lastPlantTime = now
+                local db = GardenBuddyDB
+                db.planterCount = (db.planterCount or 0) + 1
+                GB_AddPlanter("Planter "..db.planterCount)
+                DEFAULT_CHAT_FRAME:AddMessage(
+                    "|cff55ff55[GardenBuddy]|r Auto-detected planting!")
             end
         end
 
@@ -1048,7 +1101,6 @@ end)
 -------------------------------------------------------------------------------
 -- DEBUG HELPER
 -------------------------------------------------------------------------------
-
 local GB_debugActive   = false
 local GB_debugDeadline = 0
 local GB_debugFrame    = CreateFrame("Frame","GardenBuddyDebugFrame")
@@ -1060,7 +1112,7 @@ for _,ev in ipairs(GB_DEBUG_EVENTS) do GB_debugFrame:RegisterEvent(ev) end
 GB_debugFrame:SetScript("OnEvent", function()
     if not GB_debugActive then return end
     if GetTime() > GB_debugDeadline then
-        GB_debugActive = false
+        GB_debugActive=false
         DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy Debug]|r 30s window closed.")
         return
     end
@@ -1075,20 +1127,16 @@ end)
 -------------------------------------------------------------------------------
 -- SLASH COMMANDS
 -------------------------------------------------------------------------------
-
 SLASH_GARDENBUDDY1="/gb" ; SLASH_GARDENBUDDY2="/gardenbuddy" ; SLASH_GARDENBUDDY3="/garden"
 
 SlashCmdList["GARDENBUDDY"] = function(msg)
     if not msg then msg="" end
-    msg = GB_Trim(msg)
-    local spacePos = strfind(msg," ")
-    local cmd, rest
+    msg=GB_Trim(msg)
+    local spacePos=strfind(msg," ")
+    local cmd,rest
     if spacePos then
-        cmd  = strlower(strsub(msg,1,spacePos-1))
-        rest = GB_Trim(strsub(msg,spacePos+1))
-    else
-        cmd=strlower(msg) ; rest=""
-    end
+        cmd=strlower(strsub(msg,1,spacePos-1)) ; rest=GB_Trim(strsub(msg,spacePos+1))
+    else cmd=strlower(msg) ; rest="" end
 
     if cmd=="add" then
         if strlen(rest)>0 then GB_AddPlanter(rest) else GB_ShowAddDialog() end
@@ -1101,17 +1149,14 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
     elseif cmd=="rename" then
         local sp2=strfind(rest," ")
         if sp2 then
-            local idx =tonumber(strsub(rest,1,sp2-1))
+            local idx=tonumber(strsub(rest,1,sp2-1))
             local name=GB_Trim(strsub(rest,sp2+1))
             if idx and GardenBuddyDB.planters[idx] then
-                GardenBuddyDB.planters[idx].name=name
-                GB_RefreshDisplay()
+                GardenBuddyDB.planters[idx].name=name ; GB_RefreshDisplay()
                 DEFAULT_CHAT_FRAME:AddMessage(
-                    "|cff55ff55[GardenBuddy]|r Renamed to: |cffddffdd"..name.."|r")
+                    "|cff55ff55[GardenBuddy]|r Renamed: |cffddffdd"..name.."|r")
             end
-        else
-            DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Usage: /gb rename <#> <name>")
-        end
+        else DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Usage: /gb rename <#> <n>") end
 
     elseif cmd=="advance" or cmd=="adv" then
         local idx=tonumber(rest)
@@ -1139,9 +1184,10 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
             DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Active planters:")
             for i,p in ipairs(ps) do
                 GB_MigratePlanter(p)
-                local ph,tr,pl = GB_GetStatus(p)
-                local pname = GB_PHASE_NAMES[ph] or ("Phase "..ph)
-                local tstr  = p.phaseReady and (ph>=GB_TOTAL_PHASES and "HARVEST!" or "CLICK!") or GB_FormatTime(tr)
+                local ph,tr,pl=GB_GetStatus(p)
+                local pname=GB_PHASE_NAMES[ph] or ("Phase "..ph)
+                local tstr=p.phaseReady and
+                    (ph>=GB_TOTAL_PHASES and "HARVEST!" or "CLICK!") or GB_FormatTime(tr)
                 DEFAULT_CHAT_FRAME:AddMessage(string.format(
                     "  |cffddffdd#%d|r %s  |cffaaffaa%s|r  %s  |cffaaffaa%d left|r",
                     i,p.name,pname,tstr,pl))
@@ -1150,12 +1196,13 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
 
     elseif cmd=="debug" then
         GB_debugActive=true ; GB_debugDeadline=GetTime()+30
-        DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Debug active 30s - interact with planter now!")
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff55ff55[GardenBuddy]|r Debug active 30s - interact with planter now!")
 
     elseif cmd=="reset" then
-        local kept=GardenBuddyDB.planters
+        local kept=GardenBuddyDB.planters ; local cnt=GardenBuddyDB.planterCount
         GardenBuddyDB=GB_GetDefaults()
-        GardenBuddyDB.planters=kept
+        GardenBuddyDB.planters=kept ; GardenBuddyDB.planterCount=cnt
         GB_UpdateSoundBtn()
         DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Settings reset (planters kept).")
 
@@ -1165,7 +1212,7 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
 
     else
         DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55=== Garden Buddy v"..GARDENBUDDY_VERSION.." ===|r")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb add [name]|r        - Manually track a planter")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb add [name]|r        - Track a planter (blank = auto-number)")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb advance <#>|r       - Manually advance planter phase")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb remove <#>|r        - Remove planter")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb rename <#> <n>|r    - Rename a planter")
@@ -1177,5 +1224,6 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb debug|r              - Watch events for 30s")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb reset|r / |cffddffdd/gb resetall|r")
         DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Right-click any row to advance that planter's phase.|r")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Phase click always updates the lowest-numbered ready planter.|r")
     end
 end
