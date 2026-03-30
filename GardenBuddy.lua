@@ -1,5 +1,5 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v2.0
+-- GardenBuddy.lua  v2.1
 -- Turtle WoW Garden Planter Tracker
 --
 -- Lua 5.0 / WoW 1.12 notes:
@@ -18,7 +18,7 @@
 --   planter is added to the end of the queue.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "2.0.1"
+GARDENBUDDY_VERSION = "2.1"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -113,7 +113,8 @@ end
 
 -- Migrate a planter from old plantedAt format to new phaseStartTime format.
 local function GB_MigratePlanter(p)
-    if p.phaseStartTime then return end
+    if p.waiting then return end                      -- waiting state is already current
+    if p.phaseStartTime ~= nil then return end        -- already new format
     local elapsed = 0
     if p.plantedAt then elapsed = GetTime() - p.plantedAt end
     local phase = math.floor(elapsed / GB_PHASE_DUR) + 1
@@ -125,11 +126,15 @@ local function GB_MigratePlanter(p)
     p.phaseStartTime   = GetTime() - phaseElap
     p.phaseReady       = (elapsed >= phase * GB_PHASE_DUR)
     p.phaseReadyAlerted = p.phaseReady
+    p.waiting          = false
     p.plantedAt        = nil
 end
 
--- Returns currentPhase, secondsRemaining, phasesLeft
+-- Returns currentPhase, secondsRemaining (nil if waiting), phasesLeft
 local function GB_GetStatus(p)
+    if p.waiting then
+        return 1, nil, GB_TOTAL_PHASES - 1
+    end
     if p.phaseReady then
         return p.currentPhase, 0, GB_TOTAL_PHASES - p.currentPhase
     end
@@ -143,17 +148,37 @@ end
 
 -------------------------------------------------------------------------------
 -- SOUND
--- Uses Sound_SFXVolume CVar wrapped in pcall so it can never crash the addon.
+-- Volume: try Sound_SFXVolume first (1.12 verified), fall back silently.
+-- Everything wrapped in pcall so a missing CVar never crashes the addon.
 -------------------------------------------------------------------------------
+
+-- Try to find which SFX volume CVar this client actually has.
+-- Returns the name string or nil if none found.
+local GB_sfxCVar = nil
+local function GB_FindSFXCVar()
+    if GB_sfxCVar then return GB_sfxCVar end
+    local candidates = { "Sound_SFXVolume", "SFXVolume", "Sound_MasterVolume" }
+    for _, name in ipairs(candidates) do
+        local ok, val = pcall(GetCVar, name)
+        if ok and val then
+            GB_sfxCVar = name
+            return name
+        end
+    end
+    return nil
+end
+
 local function GB_SetSFXVolume(vol)
-    -- pcall silently fails if the CVar doesn't exist in this build
-    pcall(SetCVar, "Sound_SFXVolume", tostring(vol))
+    local cvar = GB_FindSFXCVar()
+    if cvar then pcall(SetCVar, cvar, tostring(vol)) end
 end
 
 local function GB_GetSFXVolume()
-    local ok, val = pcall(GetCVar, "Sound_SFXVolume")
-    if ok and val then return tonumber(val) or 1.0 end
-    return 1.0
+    local cvar = GB_FindSFXCVar()
+    if not cvar then return nil end
+    local ok, val = pcall(GetCVar, cvar)
+    if ok and val then return tonumber(val) end
+    return nil
 end
 
 local GB_savedSFXVolume = nil
@@ -164,30 +189,35 @@ local function GB_PlayChime()
     if not s or not s.file then return end
 
     local targetVol = GardenBuddyDB.soundVolume or GB_DEFAULT_VOLUME
-    GB_savedSFXVolume = GB_GetSFXVolume()
-    GB_SetSFXVolume(targetVol)
+    local current   = GB_GetSFXVolume()
+    if current ~= nil then
+        GB_savedSFXVolume = current
+        GB_SetSFXVolume(targetVol)
+    end
+
     PlaySoundFile(s.file)
 
-    -- Restore SFX volume ~0.5s later using a temporary frame
-    local t = 0
-    local rf = CreateFrame("Frame")
-    rf:SetScript("OnUpdate", function()
-        t = t + arg1
-        if t >= 0.5 then
-            if GB_savedSFXVolume then
+    -- Restore after 0.5s
+    if GB_savedSFXVolume ~= nil then
+        local t  = 0
+        local rf = CreateFrame("Frame")
+        rf:SetScript("OnUpdate", function()
+            t = t + arg1
+            if t >= 0.5 then
                 GB_SetSFXVolume(GB_savedSFXVolume)
                 GB_savedSFXVolume = nil
+                this:SetScript("OnUpdate", nil)
             end
-            this:SetScript("OnUpdate", nil)
-        end
-    end)
+        end)
+    end
 end
 
 local function GB_CheckAlerts()
     if not GardenBuddyDB or not GardenBuddyDB.planters then return end
     for _, p in ipairs(GardenBuddyDB.planters) do
         GB_MigratePlanter(p)
-        -- Phase advance notification (lastKnownPhase < currentPhase)
+        if p.waiting then return end   -- no timer running yet, nothing to alert
+        -- Phase advance notification
         if (p.lastKnownPhase or 1) < p.currentPhase then
             p.lastKnownPhase = p.currentPhase
             GB_PlayChime()
@@ -216,9 +246,10 @@ end
 -------------------------------------------------------------------------------
 -- PLANTER MANAGEMENT
 -------------------------------------------------------------------------------
+-- Add a new planter entry in the WAITING state (no timer yet).
+-- Timer starts only when GB_StartPlanter is called (seed planted).
 function GB_AddPlanter(name)
     local db = GardenBuddyDB
-    -- Auto-number: if no name given, use "Planter N"
     if not name or strlen(name) == 0 then
         db.planterCount = (db.planterCount or 0) + 1
         name = "Planter " .. db.planterCount
@@ -231,19 +262,43 @@ function GB_AddPlanter(name)
         name              = name,
         id                = db.nextId,
         currentPhase      = 1,
-        lastKnownPhase    = 0,   -- 0 so first-tick fires the "advanced to Seedling" alert
-        phaseStartTime    = GetTime(),
+        lastKnownPhase    = 1,
+        phaseStartTime    = nil,    -- nil = waiting for seed, timer not started
         phaseReady        = false,
         phaseReadyAlerted = false,
+        waiting           = true,   -- planter placed, no seed yet
     }
     db.nextId = db.nextId + 1
     table.insert(db.planters, p)
     DEFAULT_CHAT_FRAME:AddMessage(
-        "|cff55ff55[GardenBuddy]|r Tracking: |cffddffdd" .. name .. "|r")
+        "|cff55ff55[GardenBuddy]|r Planter placed: |cffddffdd" .. name ..
+        "|r - |cffffaa00plant a seed to start the timer.|r")
     if GardenBuddyMainFrame then
         GardenBuddyMainFrame:Show()
         GB_RefreshDisplay()
     end
+end
+
+-- Start the phase timer on the lowest-numbered waiting planter.
+-- Called when a seed-planting spell is detected.
+-- Returns true if a waiting planter was found and started.
+local function GB_StartFirstWaiting()
+    for i, p in ipairs(GardenBuddyDB.planters) do
+        if p.waiting then
+            p.waiting           = false
+            p.phaseStartTime    = GetTime()
+            p.currentPhase      = 1
+            p.lastKnownPhase    = 0   -- triggers "advanced to Seedling" alert
+            p.phaseReady        = false
+            p.phaseReadyAlerted = false
+            DEFAULT_CHAT_FRAME:AddMessage(
+                "|cff55ff55[GardenBuddy]|r Seed planted in |cffddffdd" ..
+                p.name .. "|r - timer started!")
+            GB_RefreshDisplay()
+            return true
+        end
+    end
+    return false
 end
 
 function GB_RemovePlanter(idx)
@@ -259,17 +314,28 @@ end
 function GB_AdvancePlanter(idx)
     local p = GardenBuddyDB.planters[idx]
     if not p then return end
+    -- If waiting, start the timer instead of advancing phase
+    if p.waiting then
+        p.waiting           = false
+        p.phaseStartTime    = GetTime()
+        p.currentPhase      = 1
+        p.lastKnownPhase    = 0
+        p.phaseReady        = false
+        p.phaseReadyAlerted = false
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff55ff55[GardenBuddy]|r Timer started for |cffddffdd"..p.name.."|r")
+        GB_RefreshDisplay()
+        return
+    end
     if p.currentPhase >= GB_TOTAL_PHASES then
         DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy]|r |cffddffdd" .. p.name ..
-            "|r is already at the final phase.")
+            "|cff55ff55[GardenBuddy]|r |cffddffdd"..p.name.."|r is already at the final phase.")
         return
     end
     p.currentPhase      = p.currentPhase + 1
     p.phaseStartTime    = GetTime()
     p.phaseReady        = false
     p.phaseReadyAlerted = false
-    -- lastKnownPhase update handled by GB_CheckAlerts on next tick
     GB_RefreshDisplay()
 end
 
@@ -910,34 +976,42 @@ function GB_RefreshDisplay()
             row:Show() ; row.planterIdx=pIdx
 
             local phase,timeRem,phasesLeft = GB_GetStatus(p)
-            local isDone  = (phase>=GB_TOTAL_PHASES and p.phaseReady)
-            local isReady = (p.phaseReady and not isDone)
-            local isWarn  = (not p.phaseReady and timeRem<120)
 
             row.nameFs:SetText("|cffddffdd"..p.name.."|r")
 
-            local pName = GB_PHASE_NAMES[phase] or ("Phase "..phase)
-            if isDone then   row.phaseFs:SetText("|cff00ff44"..pName.."|r")
-            elseif isReady then row.phaseFs:SetText("|cffffbb00"..pName.."|r")
-            elseif isWarn then  row.phaseFs:SetText("|cffffbb00"..pName.."|r")
-            else             row.phaseFs:SetText("|cffaaddaa"..pName.."|r") end
-
-            if isDone then
-                row.timeFs:SetText("|cff00ff44HARVEST!|r")
-            elseif isReady then
-                row.timeFs:SetText("|cffffaa00CLICK!|r")
-            elseif isWarn then
-                row.timeFs:SetText("|cffffbb00"..GB_FormatTime(timeRem).."|r")
+            -- Waiting state: planter placed, no seed yet
+            if p.waiting then
+                row.phaseFs:SetText("|cff888888Waiting...|r")
+                row.timeFs:SetText("|cff888888NO SEED|r")
+                row.leftFs:SetText("|cff888888-|r")
             else
-                row.timeFs:SetText("|cffffffff"..GB_FormatTime(timeRem).."|r")
-            end
+                local isDone  = (phase>=GB_TOTAL_PHASES and p.phaseReady)
+                local isReady = (p.phaseReady and not isDone)
+                local isWarn  = (not p.phaseReady and timeRem and timeRem<120)
 
-            if isDone then
-                row.leftFs:SetText("|cff00ff44Done!|r")
-            else
-                local ls = phasesLeft.." / "..(GB_TOTAL_PHASES-1)
-                if phasesLeft<=1 then row.leftFs:SetText("|cffffbb00"..ls.."|r")
-                else row.leftFs:SetText("|cffaaffaa"..ls.."|r") end
+                local pName = GB_PHASE_NAMES[phase] or ("Phase "..phase)
+                if isDone then        row.phaseFs:SetText("|cff00ff44"..pName.."|r")
+                elseif isReady then   row.phaseFs:SetText("|cffffbb00"..pName.."|r")
+                elseif isWarn then    row.phaseFs:SetText("|cffffbb00"..pName.."|r")
+                else                  row.phaseFs:SetText("|cffaaddaa"..pName.."|r") end
+
+                if isDone then
+                    row.timeFs:SetText("|cff00ff44HARVEST!|r")
+                elseif isReady then
+                    row.timeFs:SetText("|cffffaa00CLICK!|r")
+                elseif isWarn then
+                    row.timeFs:SetText("|cffffbb00"..GB_FormatTime(timeRem).."|r")
+                else
+                    row.timeFs:SetText("|cffffffff"..GB_FormatTime(timeRem).."|r")
+                end
+
+                if isDone then
+                    row.leftFs:SetText("|cff00ff44Done!|r")
+                else
+                    local ls = phasesLeft.." / "..(GB_TOTAL_PHASES-1)
+                    if phasesLeft<=1 then row.leftFs:SetText("|cffffbb00"..ls.."|r")
+                    else row.leftFs:SetText("|cffaaffaa"..ls.."|r") end
+                end
             end
         else
             row:Hide() ; row.planterIdx=nil
@@ -1066,7 +1140,6 @@ evFrame:SetScript("OnEvent", function()
         end
 
     elseif event=="SPELLCAST_START" and GB.initialized then
-        -- Store spell name (or true for instant casts that may skip START)
         GB.pendingSpell = arg1 or true
 
     elseif event=="SPELLCAST_STOP" and GB.initialized then
@@ -1074,14 +1147,20 @@ evFrame:SetScript("OnEvent", function()
         GB.pendingSpell = nil
         if not spell then return end
 
-        -- Priority 1: advance lowest-numbered phase-ready planter
+        -- Priority 1: advance lowest-numbered phase-ready planter (CLICK! state).
         local readyIdx = GB_FirstReadyIndex()
         if readyIdx then
             GB_AdvancePlanter(readyIdx)
             return
         end
 
-        -- Priority 2: no planter was ready - maybe it's a new planting
+        -- Priority 2: start timer on lowest-numbered WAITING planter (seed planted).
+        if GB_StartFirstWaiting() then
+            return
+        end
+
+        -- Priority 3: no ready and no waiting planter - add a new waiting planter
+        -- only if the spell looks like placing/planting and cooldown has passed.
         local now = GetTime()
         if (now - GB.lastPlantTime) >= GB_DETECT_COOLDOWN then
             local sn = (type(spell)=="string") and spell or ""
@@ -1090,8 +1169,6 @@ evFrame:SetScript("OnEvent", function()
                 local db = GardenBuddyDB
                 db.planterCount = (db.planterCount or 0) + 1
                 GB_AddPlanter("Planter "..db.planterCount)
-                DEFAULT_CHAT_FRAME:AddMessage(
-                    "|cff55ff55[GardenBuddy]|r Auto-detected planting!")
             end
         end
 
