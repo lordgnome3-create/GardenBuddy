@@ -1,10 +1,10 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v1.4
+-- GardenBuddy.lua  v1.5
 -- Turtle WoW Garden Planter Tracker
 -- FishingBuddy-style window - Minimap herb icon - Phase chime alerts
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.4"
+GARDENBUDDY_VERSION = "1.5"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -28,17 +28,58 @@ local GB_COL_TIME         = 68
 local GB_COL_LEFT         = 52
 local GB_MINIMAP_RADIUS   = 80
 
+-------------------------------------------------------------------------------
+-- SOUNDS
+-- PlaySoundFile takes a real .wav path and always works in 1.12.
+-- PlaySound("name") only works for a small Blizzard-hardcoded list;
+-- most names silently fail, which is why only "LevelUp" worked before.
+-------------------------------------------------------------------------------
 local GB_SOUNDS = {
-    { label = "Chime",      id = "igQuestComplete"   },
-    { label = "Level Up",   id = "LevelUp"           },
-    { label = "Raid Ping",  id = "RaidWarning"       },
-    { label = "Loot Click", id = "igItemPickup"      },
-    { label = "Coin Drop",  id = "igAbilityIconDrop" },
-    { label = "None",       id = nil                 },
+    { label = "Bell",       file = "Sound\\Interface\\UI_BellTollAlliance.wav"    },
+    { label = "Level Up",   file = "Sound\\Interface\\LevelUp.wav"               },
+    { label = "Quest Done", file = "Sound\\Interface\\iQuestComplete.wav"         },
+    { label = "Loot",       file = "Sound\\Interface\\iPickUpItem.wav"            },
+    { label = "Whisper",    file = "Sound\\Interface\\iTellMessage.wav"           },
+    { label = "None",       file = nil                                            },
 }
 
-local GB_PLANT_KEYWORDS = {
-    "place the planter",
+-------------------------------------------------------------------------------
+-- SEED / PLANTING DETECTION
+--
+-- Strategy (three layers, most-to-least precise):
+--
+-- 1. UNIT_SPELLCAST_SUCCEEDED on "player" for any spell whose name contains
+--    planting-related words.  This fires the instant the cast finishes, giving
+--    a very accurate timer start.
+--
+-- 2. CHAT_MSG_SYSTEM / CHAT_MSG_SPELL_SELF_BUFF pattern matching.
+--    Turtle WoW sends messages like:
+--      "You plant [Stranglekelp Seed] in the Garden Planter."
+--    We parse out the seed name between [ ] if present, otherwise fall back
+--    to a generic name.
+--
+-- 3. Manual /gb add as a fallback.
+-------------------------------------------------------------------------------
+
+-- Spell name fragments that indicate a planting cast (lowercase)
+local GB_PLANT_SPELLS = {
+    "plant",
+    "seed",
+    "sow",
+    "garden",
+    "planter",
+    "cultivat",
+}
+
+-- System message patterns (lowercase).
+-- Capture group 1 = optional seed/item name between [ ] brackets.
+-- If no bracket name is found we fall back to the generic planter name.
+local GB_PLANT_PATTERNS = {
+    "you plant (.+) in",
+    "you plant a (.+)",
+    "you place (.+) in the planter",
+    "you sow (.+) in",
+    "you place the planter",
     "planter placed",
     "you plant",
     "plant the seed",
@@ -55,6 +96,10 @@ GB.scrollOfs   = 0
 GB.updateTimer = 0
 GB.initialized = false
 
+-------------------------------------------------------------------------------
+-- SAVED-VARIABLE DEFAULTS
+-------------------------------------------------------------------------------
+
 local function GB_GetDefaults()
     return {
         soundEnabled = true,
@@ -67,6 +112,10 @@ local function GB_GetDefaults()
         minimapAngle = 195,
     }
 end
+
+-------------------------------------------------------------------------------
+-- UTILITIES
+-------------------------------------------------------------------------------
 
 local function GB_FormatTime(secs)
     if secs <= 0 then return "00:00" end
@@ -99,10 +148,14 @@ local function GB_DetectPhaseAdvance(planter)
     return false
 end
 
+-------------------------------------------------------------------------------
+-- SOUND
+-------------------------------------------------------------------------------
+
 local function GB_PlayChime()
     if not GardenBuddyDB.soundEnabled then return end
     local s = GB_SOUNDS[GardenBuddyDB.soundIndex]
-    if s and s.id then PlaySound(s.id) end
+    if s and s.file then PlaySoundFile(s.file) end
 end
 
 local function GB_CheckAlerts()
@@ -119,6 +172,10 @@ local function GB_CheckAlerts()
     end
 end
 
+-------------------------------------------------------------------------------
+-- PLANTER MANAGEMENT
+-------------------------------------------------------------------------------
+
 function GB_AddPlanter(name)
     local db = GardenBuddyDB
     if not name or strlen(name) == 0 then name = "Planter " .. db.nextId end
@@ -126,7 +183,12 @@ function GB_AddPlanter(name)
         DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55[GardenBuddy]|r Max planters reached.")
         return
     end
-    local p = { name = name, plantedAt = GetTime(), id = db.nextId, lastKnownPhase = 1 }
+    local p = {
+        name           = name,
+        plantedAt      = GetTime(),
+        id             = db.nextId,
+        lastKnownPhase = 1,
+    }
     db.nextId = db.nextId + 1
     table.insert(db.planters, p)
     DEFAULT_CHAT_FRAME:AddMessage(
@@ -146,6 +208,75 @@ function GB_RemovePlanter(idx)
     GB_RefreshDisplay()
 end
 
+-------------------------------------------------------------------------------
+-- PLANTING DETECTION HELPERS
+-------------------------------------------------------------------------------
+
+-- Try to extract a clean seed/item name from a message.
+-- Returns the name string or nil if not found.
+local function GB_ExtractSeedName(msg)
+    if not msg then return nil end
+    -- First try to grab text inside [ ] which is how WoW formats item links
+    local bracket = string.match(msg, "%[(.-)%]")
+    if bracket and strlen(bracket) > 0 then
+        return bracket
+    end
+    -- Try the capture patterns for plain-text seed names
+    local lower = strlower(msg)
+    local patterns = {
+        "you plant (.+) in",
+        "you sow (.+) in",
+        "you place (.+) in the planter",
+        "you plant a (.+)",
+    }
+    for _, pat in ipairs(patterns) do
+        local m = string.match(lower, pat)
+        if m and strlen(m) > 0 then
+            -- Capitalise first letter
+            return strupper(strsub(m, 1, 1)) .. strsub(m, 2)
+        end
+    end
+    return nil
+end
+
+-- Returns true if this system/buff message indicates a planting action.
+local function GB_IsPlantingMessage(msg)
+    if not msg then return false end
+    local lower = strlower(msg)
+    for _, pat in ipairs(GB_PLANT_PATTERNS) do
+        if strfind(lower, pat, 1, true) or string.match(lower, pat) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Returns true if a successfully-cast spell name indicates planting.
+local function GB_IsPlantingSpell(spellName)
+    if not spellName then return false end
+    local lower = strlower(spellName)
+    for _, frag in ipairs(GB_PLANT_SPELLS) do
+        if strfind(lower, frag, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Called by both spell and chat detection paths.
+-- seedName may be nil (falls back to "Planter N").
+local function GB_OnPlantingDetected(seedName, source)
+    local name = seedName or ("Planter " .. (table.getn(GardenBuddyDB.planters) + 1))
+    GB_AddPlanter(name)
+    DEFAULT_CHAT_FRAME:AddMessage(
+        "|cff55ff55[GardenBuddy]|r Planting detected (" .. source .. ")!" ..
+        " Tracking: |cffddffdd" .. name .. "|r")
+end
+
+-------------------------------------------------------------------------------
+-- ROW CREATION
+-------------------------------------------------------------------------------
+
 local function GB_CreateRow(parent, rowIdx)
     local row = CreateFrame("Frame", nil, parent)
     row:SetHeight(GB_ROW_H)
@@ -160,6 +291,7 @@ local function GB_CreateRow(parent, rowIdx)
         bg:SetTexture(0.06, 0.16, 0.06, 0.22)
     end
 
+    -- Delete widget as plain Frame (avoids all Button-only API issues in 1.12)
     local del = CreateFrame("Frame", nil, row)
     del:SetWidth(GB_COL_DEL)
     del:SetHeight(GB_ROW_H - 2)
@@ -219,6 +351,10 @@ local function GB_CreateRow(parent, rowIdx)
     return row
 end
 
+-------------------------------------------------------------------------------
+-- MAIN FRAME
+-------------------------------------------------------------------------------
+
 local function GB_CalcFrameHeight()
     return GB_PAD + 24 + 6 + 18 + 4 + (GB_MAX_VISIBLE_ROWS * GB_ROW_H) + 6 + 24 + GB_PAD
 end
@@ -249,6 +385,7 @@ local function GB_CreateMainFrame()
         GardenBuddyDB.posY = y
     end)
 
+    -- Title bar
     local titleBar = CreateFrame("Frame", nil, f)
     titleBar:SetHeight(24)
     titleBar:SetPoint("TOPLEFT",  f, "TOPLEFT",  GB_PAD,         -GB_PAD)
@@ -263,10 +400,12 @@ local function GB_CreateMainFrame()
     verFs:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
     verFs:SetText("|cff668866v" .. GARDENBUDDY_VERSION .. "|r")
 
+    -- Close button
     local closeBtn = CreateFrame("Button", "GardenBuddyCloseBtn", f, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
     closeBtn:SetScript("OnClick", function() GardenBuddyMainFrame:Hide() end)
 
+    -- Minimize button
     local minBtn = CreateFrame("Button", "GardenBuddyMinBtn", f)
     minBtn:SetWidth(16) ; minBtn:SetHeight(16)
     minBtn:SetPoint("TOPRIGHT", closeBtn, "TOPLEFT", -2, 0)
@@ -281,6 +420,7 @@ local function GB_CreateMainFrame()
     end)
     minBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+    -- Column headers
     local hdrY     = -(GB_PAD + 24 + 6)
     local hdrFrame = CreateFrame("Frame", nil, f)
     hdrFrame:SetHeight(18)
@@ -304,6 +444,7 @@ local function GB_CreateMainFrame()
     MakeHdr("Left",      GB_COL_LEFT,  hx, "CENTER")
     f.hdrFrame = hdrFrame
 
+    -- Row content area
     local contentY = hdrY - 18 - 4
     local contentH = GB_MAX_VISIBLE_ROWS * GB_ROW_H
     local content  = CreateFrame("Frame", nil, f)
@@ -318,6 +459,7 @@ local function GB_CreateMainFrame()
     noPlFs:Hide()
     f.noPlText = noPlFs
 
+    -- Scroll arrows
     local upArrow = CreateFrame("Button", nil, f)
     upArrow:SetWidth(14) ; upArrow:SetHeight(14)
     upArrow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 16, 0)
@@ -349,6 +491,7 @@ local function GB_CreateMainFrame()
         GB.rows[i] = GB_CreateRow(content, i)
     end
 
+    -- Separator
     local sepY = contentY - contentH - 3
     local sep  = f:CreateTexture(nil, "ARTWORK")
     sep:SetHeight(2)
@@ -356,6 +499,7 @@ local function GB_CreateMainFrame()
     sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -GB_PAD - 4, sepY)
     sep:SetTexture(0.15, 0.45, 0.15, 0.8)
 
+    -- Bottom buttons
     local addBtn = CreateFrame("Button", "GardenBuddyAddBtn", f, "GameMenuButtonTemplate")
     addBtn:SetWidth(110) ; addBtn:SetHeight(22)
     addBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", GB_PAD, GB_PAD + 2)
@@ -374,6 +518,7 @@ local function GB_CreateMainFrame()
     soundBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
     f.soundBtn = soundBtn
 
+    -- OnUpdate: throttled to ~1 second
     f:SetScript("OnUpdate", function()
         GB.updateTimer = GB.updateTimer + arg1
         if GB.updateTimer >= 1.0 then
@@ -388,6 +533,10 @@ local function GB_CreateMainFrame()
     GB_UpdateBottomButtons()
     return f
 end
+
+-------------------------------------------------------------------------------
+-- MINIMAP BUTTON
+-------------------------------------------------------------------------------
 
 local function GB_UpdateMinimapPos()
     local btn = GardenBuddyMinimapBtn
@@ -407,7 +556,7 @@ local function GB_CreateMinimapButton()
     btn:SetClampedToScreen(true)
 
     -- SetNormalTexture is the correct 1.12 Button API for the face icon.
-    -- Swap the texture name to change the herb:
+    -- Swap the texture to change the herb:
     --   Firebloom:   INV_Misc_Herb_Firebloom
     --   Plaguebloom: INV_Misc_Herb_PlagueFlower
     --   Icecap:      INV_Misc_Herb_Icecap
@@ -435,8 +584,7 @@ local function GB_CreateMinimapButton()
         local mx, my = Minimap:GetCenter()
         local cx, cy = GetCursorPosition()
         local s      = UIParent:GetScale()
-        cx = cx / s
-        cy = cy / s
+        cx = cx / s ; cy = cy / s
         local newAngle = math.deg(math.atan2(cy - my, cx - mx))
         if not isDragging then
             local diff = math.abs(newAngle - (GardenBuddyDB.minimapAngle or 195))
@@ -481,11 +629,15 @@ local function GB_CreateMinimapButton()
     return btn
 end
 
+-------------------------------------------------------------------------------
+-- BOTTOM BUTTON LABELS / SOUND CYCLING
+-------------------------------------------------------------------------------
+
 function GB_UpdateBottomButtons()
     local f = GardenBuddyMainFrame
     if not f then return end
     local snd = GB_SOUNDS[GardenBuddyDB.soundIndex]
-    if GardenBuddyDB.soundEnabled and snd and snd.id then
+    if GardenBuddyDB.soundEnabled and snd and snd.file then
         f.soundBtn:SetText("|cff55ff55Alert: " .. snd.label .. "|r")
     else
         f.soundBtn:SetText("|cffff5555Alert: Off|r")
@@ -496,14 +648,18 @@ function GB_CycleSound()
     local db = GardenBuddyDB
     db.soundIndex = math.mod(db.soundIndex, table.getn(GB_SOUNDS)) + 1
     local s = GB_SOUNDS[db.soundIndex]
-    if s and s.id then
+    if s and s.file then
         db.soundEnabled = true
-        PlaySound(s.id)
+        PlaySoundFile(s.file)
     else
         db.soundEnabled = false
     end
     GB_UpdateBottomButtons()
 end
+
+-------------------------------------------------------------------------------
+-- MINIMIZE / RESTORE
+-------------------------------------------------------------------------------
 
 function GB_ToggleMinimize()
     local db = GardenBuddyDB
@@ -531,18 +687,25 @@ function GB_ToggleMinimize()
     end
 end
 
+-------------------------------------------------------------------------------
+-- DISPLAY REFRESH
+-------------------------------------------------------------------------------
+
 function GB_RefreshDisplay()
     local f = GardenBuddyMainFrame
     if not f then return end
     local planters = GardenBuddyDB.planters
     local total    = table.getn(planters)
+
     if total == 0 then f.noPlText:Show() else f.noPlText:Hide() end
+
     if total > GB_MAX_VISIBLE_ROWS then
         f.upArrow:Show() ; f.downArrow:Show()
     else
         f.upArrow:Hide() ; f.downArrow:Hide()
         GB.scrollOfs = 0
     end
+
     for i = 1, GB_MAX_VISIBLE_ROWS do
         local row  = GB.rows[i]
         local pIdx = i + GB.scrollOfs
@@ -552,8 +715,10 @@ function GB_RefreshDisplay()
             row.planterIdx = pIdx
             local phase, timeRem, phasesLeft = GB_GetStatus(p)
             local isReady = (phasesLeft == 0 and timeRem <= 0)
-            local isWarn  = (not isReady and timeRem < 120)
+            local isWarn  = (not isReady and timeRem < 120)  -- < 2 min
+
             row.nameFs:SetText("|cffddffdd" .. p.name .. "|r")
+
             local pName = GB_PHASE_NAMES[phase] or ("Phase " .. phase)
             if isReady then
                 row.phaseFs:SetText("|cff00ff44" .. pName .. "|r")
@@ -562,6 +727,7 @@ function GB_RefreshDisplay()
             else
                 row.phaseFs:SetText("|cffaaddaa" .. pName .. "|r")
             end
+
             if isReady then
                 row.timeFs:SetText("|cff00ff44HARVEST!|r")
             elseif isWarn then
@@ -569,6 +735,7 @@ function GB_RefreshDisplay()
             else
                 row.timeFs:SetText("|cffffffff" .. GB_FormatTime(timeRem) .. "|r")
             end
+
             if isReady then
                 row.leftFs:SetText("|cff00ff44Done!|r")
             else
@@ -584,8 +751,13 @@ function GB_RefreshDisplay()
             row.planterIdx = nil
         end
     end
+
     GB_UpdateBottomButtons()
 end
+
+-------------------------------------------------------------------------------
+-- ADD PLANTER DIALOG
+-------------------------------------------------------------------------------
 
 local function GB_CreateAddDialog()
     local d = CreateFrame("Frame", "GardenBuddyAddDialog", UIParent)
@@ -653,22 +825,25 @@ function GB_ShowAddDialog()
     GardenBuddyAddDialog:Show()
 end
 
-local function GB_CheckChatForPlanting(msg)
-    if not msg then return false end
-    local lower = strlower(msg)
-    for _, kw in ipairs(GB_PLANT_KEYWORDS) do
-        if strfind(lower, kw, 1, true) then return true end
-    end
-    return false
-end
+-------------------------------------------------------------------------------
+-- EVENT HANDLER
+-- Listens on three fronts for planting:
+--   1. UNIT_SPELLCAST_SUCCEEDED  -- most precise; fires at cast completion
+--   2. CHAT_MSG_SYSTEM           -- system messages from the server
+--   3. CHAT_MSG_SPELL_SELF_BUFF  -- self-buff messages
+-- All three try to extract a seed name to auto-label the planter.
+-------------------------------------------------------------------------------
 
 local evFrame = CreateFrame("Frame", "GardenBuddyEventFrame")
 evFrame:RegisterEvent("ADDON_LOADED")
 evFrame:RegisterEvent("PLAYER_LOGOUT")
+evFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 evFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 evFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
 
 evFrame:SetScript("OnEvent", function()
+
+    -- -------------------------------------------------------------------------
     if event == "ADDON_LOADED" and arg1 == "GardenBuddy" then
         if not GardenBuddyDB then
             GardenBuddyDB = GB_GetDefaults()
@@ -678,19 +853,23 @@ evFrame:SetScript("OnEvent", function()
                 if GardenBuddyDB[k] == nil then GardenBuddyDB[k] = v end
             end
         end
+
         GardenBuddyMainFrame = GB_CreateMainFrame()
         GardenBuddyMainFrame:Hide()
         GB_CreateMinimapButton()
+
         if GardenBuddyDB.minimized then
             GardenBuddyDB.minimized = false
             GB_ToggleMinimize()
         end
+
         GB_RefreshDisplay()
         DEFAULT_CHAT_FRAME:AddMessage(
             "|cff55ff55[GardenBuddy]|r v" .. GARDENBUDDY_VERSION ..
             " loaded - click the |cff33dd33herb minimap icon|r or type |cffddffdd/gb|r.")
         GB.initialized = true
 
+    -- -------------------------------------------------------------------------
     elseif event == "PLAYER_LOGOUT" then
         if GardenBuddyMainFrame then
             local _, _, _, x, y = GardenBuddyMainFrame:GetPoint()
@@ -698,17 +877,48 @@ evFrame:SetScript("OnEvent", function()
             GardenBuddyDB.posY = y
         end
 
+    -- -------------------------------------------------------------------------
+    -- Layer 1: spell-cast detection (most precise timer start)
+    -- arg1 = unit, arg2 = spell name, arg3 = rank, arg4 = cast GUID (ignored)
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" and GB.initialized then
+        if arg1 == "player" and GB_IsPlantingSpell(arg2) then
+            -- Spell name often contains the seed name, e.g. "Plant Stranglekelp"
+            local seedName = arg2   -- use full spell name; player can rename later
+            GB_OnPlantingDetected(seedName, "spell")
+        end
+
+    -- -------------------------------------------------------------------------
+    -- Layer 2 & 3: chat message detection (fallback / cross-check)
     elseif (event == "CHAT_MSG_SYSTEM" or event == "CHAT_MSG_SPELL_SELF_BUFF")
            and GB.initialized then
-        if GB_CheckChatForPlanting(arg1) then
-            local name = "Planter " .. (table.getn(GardenBuddyDB.planters) + 1)
-            GB_AddPlanter(name)
-            DEFAULT_CHAT_FRAME:AddMessage(
-                "|cff55ff55[GardenBuddy]|r Auto-detected planting! " ..
-                "Rename with |cffddffdd/gb rename <#> <n>|r if needed.")
+        -- arg1 = the message text
+        if GB_IsPlantingMessage(arg1) then
+            -- If a spell detection already fired within the last 2 seconds
+            -- for the same planting action, skip to avoid duplicates.
+            local now = GetTime()
+            if GB.lastPlantTime and (now - GB.lastPlantTime) < 2 then
+                GB.lastPlantTime = nil   -- consume the guard
+            else
+                local seedName = GB_ExtractSeedName(arg1)
+                GB_OnPlantingDetected(seedName, "chat")
+            end
         end
     end
 end)
+
+-- Guard so the spell event can suppress a near-simultaneous chat event
+-- (both fire for the same planting action on some Turtle WoW builds).
+local _origOnPlantingDetected = GB_OnPlantingDetected
+GB_OnPlantingDetected = function(seedName, source)
+    if source == "spell" then
+        GB.lastPlantTime = GetTime()
+    end
+    _origOnPlantingDetected(seedName, source)
+end
+
+-------------------------------------------------------------------------------
+-- SLASH COMMANDS
+-------------------------------------------------------------------------------
 
 SLASH_GARDENBUDDY1 = "/gb"
 SLASH_GARDENBUDDY2 = "/gardenbuddy"
@@ -717,6 +927,7 @@ SLASH_GARDENBUDDY3 = "/garden"
 SlashCmdList["GARDENBUDDY"] = function(msg)
     if not msg then msg = "" end
     msg = strtrim(msg)
+
     local spacePos = strfind(msg, " ")
     local cmd, rest
     if spacePos then
@@ -732,9 +943,12 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
 
     elseif cmd == "remove" or cmd == "rem" or cmd == "del" then
         local idx = tonumber(rest)
-        if idx then GB_RemovePlanter(idx)
-        else DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy]|r Usage: /gb remove <number>") end
+        if idx then
+            GB_RemovePlanter(idx)
+        else
+            DEFAULT_CHAT_FRAME:AddMessage(
+                "|cff55ff55[GardenBuddy]|r Usage: /gb remove <number>")
+        end
 
     elseif cmd == "rename" then
         local sp2 = strfind(rest, " ")
@@ -808,7 +1022,7 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
 
     else
         DEFAULT_CHAT_FRAME:AddMessage("|cff55ff55=== Garden Buddy v" .. GARDENBUDDY_VERSION .. " ===|r")
-        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb add [name]|r      - Track a new planter")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb add [name]|r      - Manually track a planter")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb remove <#>|r      - Remove planter by number")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb rename <#> <n>|r  - Rename a planter")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb clear|r            - Remove all planters")
@@ -818,6 +1032,7 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb sound|r            - Cycle alert sound")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb reset|r            - Reset settings (keep planters)")
         DEFAULT_CHAT_FRAME:AddMessage("  |cffddffdd/gb resetall|r         - Full wipe")
+        DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Auto-detects planting via spell cast or chat message.|r")
         DEFAULT_CHAT_FRAME:AddMessage("  |cff668866Phase: 9 min fixed. Minimap: L-click=toggle, R-click=add, drag=move|r")
     end
 end
