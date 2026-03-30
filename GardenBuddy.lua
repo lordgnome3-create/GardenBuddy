@@ -1,5 +1,5 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v1.7
+-- GardenBuddy.lua  v1.8
 -- Turtle WoW Garden Planter Tracker
 -- FishingBuddy-style window - Minimap herb icon - Phase chime alerts
 --
@@ -8,7 +8,7 @@
 -- UNIT_SPELLCAST_SUCCEEDED does not exist in 1.12; detection is chat-only.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.7"
+GARDENBUDDY_VERSION = "1.8"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -857,16 +857,54 @@ end)
 -- which helps identify what text Turtle WoW actually sends on planting.
 -------------------------------------------------------------------------------
 
--- Debug helper: captures the next CHAT_MSG_SYSTEM and prints it
-local GB_debugCapture = false
-local GB_debugFrame   = CreateFrame("Frame", "GardenBuddyDebugFrame")
-GB_debugFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+-- Debug helper: listens on EVERY planting-relevant event type for 30 seconds
+-- and prints each one to chat so we can see exactly what fires on planting.
+local GB_debugCapture  = false
+local GB_debugDeadline = 0
+local GB_debugFrame    = CreateFrame("Frame", "GardenBuddyDebugFrame")
+
+-- All event types that could plausibly carry a planting message
+local GB_DEBUG_EVENTS = {
+    "CHAT_MSG_SYSTEM",
+    "CHAT_MSG_SPELL_SELF_BUFF",
+    "CHAT_MSG_SPELL_SELF_DAMAGE",
+    "CHAT_MSG_SPELL_CREATURE_VS_SELF_BUFF",
+    "CHAT_MSG_COMBAT_SELF_HITS",
+    "CHAT_MSG_LOOT",
+    "CHAT_MSG_SAY",
+    "CHAT_MSG_EMOTE",
+    "CHAT_MSG_TEXT_EMOTE",
+    "SPELLCAST_STOP",
+    "SPELLCAST_CHANNEL_STOP",
+    "PLAYER_TARGET_CHANGED",
+    "CHAT_MSG_COMBAT_HOSTILE_DEATH",
+    "CHAT_MSG_SKILL",
+}
+
+for _, ev in ipairs(GB_DEBUG_EVENTS) do
+    GB_debugFrame:RegisterEvent(ev)
+end
+
 GB_debugFrame:SetScript("OnEvent", function()
-    if GB_debugCapture and arg1 then
-        DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy Debug]|r System msg: |cffddffdd" .. arg1 .. "|r")
+    if not GB_debugCapture then return end
+    if GetTime() > GB_debugDeadline then
         GB_debugCapture = false
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff55ff55[GardenBuddy Debug]|r 30s window closed. " ..
+            "If nothing showed, the planting action uses a different " ..
+            "event type. Try /gb debug again immediately before planting.")
+        return
     end
+    -- Print every event with its arguments so nothing is missed
+    local a1 = tostring(arg1 or "")
+    local a2 = tostring(arg2 or "")
+    local a3 = tostring(arg3 or "")
+    local snippet = strsub(a1, 1, 80)  -- truncate long messages
+    DEFAULT_CHAT_FRAME:AddMessage(
+        "|cff55ff55[GardenBuddy Debug]|r |cffffaa00" .. event .. "|r " ..
+        "|cffddffdd" .. snippet .. "|r" ..
+        (strlen(a2) > 0 and (" / " .. strsub(a2, 1, 40)) or "") ..
+        (strlen(a3) > 0 and (" / " .. strsub(a3, 1, 40)) or ""))
 end)
 
 -- strtrim does not exist in WoW 1.12 (added in TBC).
@@ -962,12 +1000,14 @@ SlashCmdList["GARDENBUDDY"] = function(msg)
         end
 
     elseif cmd == "debug" then
-        -- Captures the next system message so you can see exactly what
-        -- Turtle WoW sends when you plant a seed.
-        GB_debugCapture = true
+        GB_debugCapture  = true
+        GB_debugDeadline = GetTime() + 30
         DEFAULT_CHAT_FRAME:AddMessage(
-            "|cff55ff55[GardenBuddy]|r Debug mode: plant a seed now. " ..
-            "The next system message will be printed to chat.")
+            "|cff55ff55[GardenBuddy]|r Debug active for 30 seconds.")
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff55ff55[GardenBuddy]|r |cffffaa00Plant a seed in a planter RIGHT NOW.|r")
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff55ff55[GardenBuddy]|r Every game event will print to chat.")
 
     elseif cmd == "reset" then
         local kept = GardenBuddyDB.planters
