@@ -1,5 +1,5 @@
 -------------------------------------------------------------------------------
--- GardenBuddy.lua  v1.9
+-- GardenBuddy.lua  v1.9.1
 -- Turtle WoW Garden Planter Tracker
 --
 -- Lua 5.0 / WoW 1.12 notes:
@@ -16,7 +16,7 @@
 --   elapsed-since-planting calculation.
 -------------------------------------------------------------------------------
 
-GARDENBUDDY_VERSION = "1.9"
+GARDENBUDDY_VERSION = "1.9.2"
 
 local GB_PHASE_NAMES = {
     [1] = "Seedling",
@@ -54,8 +54,8 @@ local GB_SOUNDS = {
     { label = "None",       file = nil                                     },
 }
 
--- Default volume (0.0 - 1.0)
-local GB_DEFAULT_VOLUME = 0.75
+-- Default volume note: use ESC -> Sound Options in-game to adjust volume.
+-- WoW 1.12 does not expose a scriptable master volume CVar.
 
 -------------------------------------------------------------------------------
 -- SPELL DETECTION
@@ -68,8 +68,6 @@ local GB_DEFAULT_VOLUME = 0.75
 -------------------------------------------------------------------------------
 
 local GB_PLANT_WORDS = { "plant", "seed", "sow", "garden", "planter", "cultivat" }
-local GB_TEND_WORDS  = { "tend", "water", "harvest", "pick", "pluck", "care",
-                         "advance", "check", "gather", "collect", "prune" }
 
 local GB_DETECT_COOLDOWN = 3   -- seconds between auto-adds
 
@@ -80,7 +78,6 @@ GB.updateTimer   = 0
 GB.initialized   = false
 GB.lastPlantTime = 0
 GB.pendingSpell  = nil    -- saved from SPELLCAST_START
-GB.pendingIsTend = false  -- true if pending spell is a tending action
 
 -------------------------------------------------------------------------------
 -- SAVED-VARIABLE DEFAULTS
@@ -90,7 +87,6 @@ local function GB_GetDefaults()
     return {
         soundEnabled = true,
         soundIndex   = 1,
-        soundVolume  = GB_DEFAULT_VOLUME,
         planters     = {},
         nextId       = 1,
         posX         = 200,
@@ -157,35 +153,13 @@ local function GB_GetStatus(p)
 end
 
 -------------------------------------------------------------------------------
--- SOUND  (uses SetCVar to honour per-alert volume setting)
+-- SOUND  (plain PlaySoundFile - no CVar manipulation, not supported in 1.12)
 -------------------------------------------------------------------------------
-
-local GB_prevVolume = nil
 
 local function GB_PlayChime()
     if not GardenBuddyDB.soundEnabled then return end
     local s = GB_SOUNDS[GardenBuddyDB.soundIndex]
-    if not s or not s.file then return end
-
-    -- Temporarily apply our volume setting, restore after 1 s
-    local vol = tostring(GardenBuddyDB.soundVolume or GB_DEFAULT_VOLUME)
-    GB_prevVolume = GetCVar("Sound_MasterVolume")
-    SetCVar("Sound_MasterVolume", vol)
-    PlaySoundFile(s.file)
-
-    -- Restore volume on next OnUpdate tick (roughly 0.5 s later)
-    local restoreTimer = 0
-    local restoreFrame = CreateFrame("Frame")
-    restoreFrame:SetScript("OnUpdate", function()
-        restoreTimer = restoreTimer + arg1
-        if restoreTimer >= 0.5 then
-            if GB_prevVolume then
-                SetCVar("Sound_MasterVolume", GB_prevVolume)
-                GB_prevVolume = nil
-            end
-            this:SetScript("OnUpdate", nil)
-        end
-    end)
+    if s and s.file then PlaySoundFile(s.file) end
 end
 
 local function GB_CheckAlerts()
@@ -302,19 +276,6 @@ local function GB_SeedNameFromSpell(spellName)
         end
     end
     return spellName
-end
-
--- When a tending spell completes, advance the first ready planter (if any).
--- If no planter is ready, it could be a repeat-plant; do nothing (avoids
--- accidental double-adds during normal harvesting/replanting flows).
-local function GB_OnTendingComplete()
-    local ps = GardenBuddyDB.planters
-    for i, p in ipairs(ps) do
-        if p.phaseReady and p.currentPhase < GB_TOTAL_PHASES then
-            GB_AdvancePlanter(i)
-            return
-        end
-    end
 end
 
 local function GB_OnPlantingComplete(spellName)
@@ -608,7 +569,7 @@ end
 
 local function GB_CreateSettingsPanel()
     local p = CreateFrame("Frame","GardenBuddySettings",UIParent)
-    p:SetWidth(260) ; p:SetHeight(190)
+    p:SetWidth(260) ; p:SetHeight(172)
     p:SetPoint("CENTER",UIParent,"CENTER",0,0)
     p:SetBackdrop({
         bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -674,48 +635,25 @@ local function GB_CreateSettingsPanel()
     testBtn:SetText("Test")
     testBtn:SetScript("OnClick", function() GB_PlayChime() end)
 
-    -- ---- Volume section ----
-    local volLabel = p:CreateFontString(nil,"OVERLAY","GameFontNormal")
-    volLabel:SetPoint("TOPLEFT",p,"TOPLEFT",18,-96)
-    volLabel:SetText("|cffaaffaaAlert Volume:|r")
-
-    local volMinus = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
-    volMinus:SetWidth(28) ; volMinus:SetHeight(20)
-    volMinus:SetPoint("TOPLEFT",p,"TOPLEFT",18,-114)
-    volMinus:SetText("-")
-    volMinus:SetScript("OnClick", function()
-        local v = GardenBuddyDB.soundVolume or GB_DEFAULT_VOLUME
-        v = v - 0.1
-        if v < 0.1 then v = 0.1 end
-        GardenBuddyDB.soundVolume = math.floor(v*10+0.5)/10
-        GB_UpdateSettingsPanel()
-    end)
-
-    local volDisp = p:CreateFontString("GardenBuddyVolDisp",nil,"GameFontNormal")
-    volDisp:SetWidth(60)
-    volDisp:SetPoint("LEFT",volMinus,"RIGHT",6,0)
-    volDisp:SetJustifyH("CENTER")
-
-    local volPlus = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
-    volPlus:SetWidth(28) ; volPlus:SetHeight(20)
-    volPlus:SetPoint("LEFT",volDisp,"RIGHT",6,0)
-    volPlus:SetText("+")
-    volPlus:SetScript("OnClick", function()
-        local v = GardenBuddyDB.soundVolume or GB_DEFAULT_VOLUME
-        v = v + 0.1
-        if v > 1.0 then v = 1.0 end
-        GardenBuddyDB.soundVolume = math.floor(v*10+0.5)/10
-        GB_UpdateSettingsPanel()
-    end)
-
+    -- ---- Volume note ----
+    -- WoW 1.12 does not expose a scriptable master volume CVar, so alert
+    -- volume is controlled through the in-game Sound Options (ESC -> Sound).
     local volNote = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    volNote:SetPoint("TOPLEFT",p,"TOPLEFT",18,-136)
-    volNote:SetText("|cff668866Volume is applied only during alert sounds.|r")
+    volNote:SetPoint("TOPLEFT",p,"TOPLEFT",18,-96)
+    volNote:SetTextColor(1.0, 0.8, 0.2)
+    volNote:SetText("Alert volume is controlled via the")
+    local volNote2 = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    volNote2:SetPoint("TOPLEFT",p,"TOPLEFT",18,-110)
+    volNote2:SetTextColor(1.0, 0.8, 0.2)
+    volNote2:SetText("in-game Sound Options (ESC -> Sound).")
 
     -- ---- Info ----
     local infoFs = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
-    infoFs:SetPoint("TOPLEFT",p,"TOPLEFT",18,-154)
+    infoFs:SetPoint("TOPLEFT",p,"TOPLEFT",18,-132)
     infoFs:SetText("|cff668866Right-click a planter row to manually advance its phase.|r")
+    local infoFs2 = p:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    infoFs2:SetPoint("TOPLEFT",p,"TOPLEFT",18,-146)
+    infoFs2:SetText("|cff668866Use /gb advance <#> to advance via command.|r")
 
     -- Close button at bottom
     local doneBtn = CreateFrame("Button",nil,p,"GameMenuButtonTemplate")
@@ -738,8 +676,6 @@ function GB_UpdateSettingsPanel()
     else
         GardenBuddySndName:SetText("|cffff5555Off|r")
     end
-    local vol = db.soundVolume or GB_DEFAULT_VOLUME
-    GardenBuddyVolDisp:SetText("|cffffffff"..math.floor(vol*100+0.5).."%|r")
 end
 
 function GB_ToggleSettings()
@@ -1073,26 +1009,33 @@ evFrame:SetScript("OnEvent", function()
         end
 
     elseif event=="SPELLCAST_START" and GB.initialized then
-        -- arg1=spell name, arg2=rank, arg3=cast time ms
-        if GB_SpellMatchesWords(arg1, GB_PLANT_WORDS) then
-            GB.pendingSpell  = arg1
-            GB.pendingIsTend = false
-        elseif GB_SpellMatchesWords(arg1, GB_TEND_WORDS) then
-            GB.pendingSpell  = arg1
-            GB.pendingIsTend = true
-        else
-            GB.pendingSpell = nil
-        end
+        -- Save whatever spell just started; we decide what to do on STOP.
+        -- arg1 = spell name (may be nil for instant casts that skip START)
+        GB.pendingSpell = arg1 or true   -- 'true' = instant, no name
 
     elseif event=="SPELLCAST_STOP" and GB.initialized then
-        if GB.pendingSpell then
-            local spell   = GB.pendingSpell
-            local isTend  = GB.pendingIsTend
-            GB.pendingSpell = nil
-            if isTend then
-                GB_OnTendingComplete()
-            else
-                GB_OnPlantingComplete(spell)
+        local spell = GB.pendingSpell
+        GB.pendingSpell = nil
+        if not spell then return end
+
+        -- PRIORITY 1: If any planter is phase-ready and waiting for the
+        -- player to interact, advance it now -- no spell name matching needed.
+        -- The player just cast something at/near the planter, that's enough.
+        local advanced = false
+        for i, p in ipairs(GardenBuddyDB.planters) do
+            if p.phaseReady and p.currentPhase < GB_TOTAL_PHASES then
+                GB_AdvancePlanter(i)
+                advanced = true
+                break
+            end
+        end
+
+        -- PRIORITY 2: If nothing was ready to advance, check if this looks
+        -- like a fresh planting spell and add a new planter.
+        if not advanced then
+            local spellName = (spell == true) and "" or spell
+            if GB_SpellMatchesWords(spellName, GB_PLANT_WORDS) then
+                GB_OnPlantingComplete(spellName)
             end
         end
 
